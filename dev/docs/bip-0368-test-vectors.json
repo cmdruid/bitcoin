@@ -1,0 +1,47 @@
+{
+  "keypath_no_tree": {
+    "description": "Key-path spend with annex type 0x02, no script tree (34-byte annex)",
+    "internal_pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "output_pubkey": "da4710964f7852695de2da025290e24af6d8c281de5a0b902b7135fd9fd74d21",
+    "merkle_root": "",
+    "annex": "500279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "annex_length": 34,
+    "annex_type_byte": "0x02"
+  },
+  "keypath_with_tree": {
+    "description": "Key-path spend with annex type 0x02, with script tree (66-byte annex)",
+    "internal_pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "output_pubkey": "9b6ce0db0707e29f92bf8893ed1911d397e3d2d76bbc68110c49da2ceec8be23",
+    "merkle_root": "a85b2107f791b26a84e7586c28cec7cb61202ed3d01944d832500f363782d675",
+    "annex": "500279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798a85b2107f791b26a84e7586c28cec7cb61202ed3d01944d832500f363782d675",
+    "annex_length": 66
+  },
+  "nums_rejection": {
+    "description": "NUMS internal key banned \u2014 key-path spend must fail",
+    "internal_pubkey": "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+    "output_pubkey": "192c2a30cbd7d0352f94d4c31a43f767f1ef43d7ff6438839880ec075d81a9f6",
+    "annex": "500250929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0",
+    "expected_error": "KEYPATH_NUMS_BANNED",
+    "rationale": "NUMS point has unknown classical DL but is recoverable by quantum adversary"
+  },
+  "wrong_internal_key": {
+    "description": "Wrong internal key \u2014 does not reconstruct output key Q",
+    "real_internal_pubkey": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "provided_internal_pubkey": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "output_pubkey": "da4710964f7852695de2da025290e24af6d8c281de5a0b902b7135fd9fd74d21",
+    "annex": "5002c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+    "expected_error": "KEYPATH_TWEAK_MISMATCH"
+  },
+  "annex_format": {
+    "description": "Annex encoding examples for BIP 368",
+    "valid_no_tree": "500279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "valid_no_tree_length": 34,
+    "valid_with_tree": "500279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798a85b2107f791b26a84e7586c28cec7cb61202ed3d01944d832500f363782d675",
+    "valid_with_tree_length": 66,
+    "invalid_wrong_type": "500479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "invalid_wrong_length": "500279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179800",
+    "format_no_tree": "0x50 || 0x02 || P (32 bytes) = 34 bytes",
+    "format_with_tree": "0x50 || 0x02 || P (32 bytes) || merkle_root (32 bytes) = 66 bytes",
+    "note": "No parity byte needed \u2014 parity derived via CreateTapTweak"
+  }
+}
