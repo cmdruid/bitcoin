@@ -119,6 +119,24 @@ std::string ScriptErrorString(const ScriptError serror)
             return "Signature is found in scriptCode";
         case SCRIPT_ERR_SCRIPTNUM:
             return "Script number overflowed or is non-minimally encoded";
+        case SCRIPT_ERR_KEYPATH_MISSING_ANNEX:
+            return "Key-path spend requires annex with internal key (BIP 368)";
+        case SCRIPT_ERR_KEYPATH_BAD_ANNEX_FORMAT:
+            return "Key-path annex has wrong type byte or length";
+        case SCRIPT_ERR_KEYPATH_TWEAK_MISMATCH:
+            return "Internal key does not reconstruct the output key";
+        case SCRIPT_ERR_KEYPATH_NUMS_BANNED:
+            return "Key-path spending with NUMS internal key is banned";
+        case SCRIPT_ERR_SPHINCS_MISSING_ANNEX:
+            return "SPHINCS+ annex missing or has wrong type byte";
+        case SCRIPT_ERR_SPHINCS_BAD_ANNEX_FORMAT:
+            return "SPHINCS+ annex format is invalid";
+        case SCRIPT_ERR_SPHINCS_NO_SIG_REMAINING:
+            return "No SPHINCS+ signature remaining in annex";
+        case SCRIPT_ERR_SPHINCS_VERIFY_FAILED:
+            return "SPHINCS+ signature verification failed";
+        case SCRIPT_ERR_SPHINCS_UNCONSUMED_SIGS:
+            return "Unconsumed SPHINCS+ signatures in annex";
         case SCRIPT_ERR_UNKNOWN_ERROR:
         case SCRIPT_ERR_ERROR_COUNT:
             break;

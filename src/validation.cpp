@@ -1139,7 +1139,20 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     const CTransaction& tx = *ws.m_ptx;
     TxValidationState& state = ws.m_state;
 
-    constexpr script_verify_flags scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    script_verify_flags scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+
+    // BIP 368: Dynamically add key-path hardening when deployment is active
+    if (DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_KEYPATH_HARDENING)) {
+        scriptVerifyFlags |= SCRIPT_VERIFY_KEYPATH_HARDENING;
+    }
+
+    // BIP 369: Dynamically add SPHINCS+ verification when both BIP 369 and BIP 368
+    // deployments are active. BIP 369 requires BIP 368 co-activation — without
+    // key-path hardening, a quantum adversary can bypass SPHINCS+ via key-path.
+    if (DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_SPHINCS) &&
+        DeploymentActiveAfter(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman, Consensus::DEPLOYMENT_KEYPATH_HARDENING)) {
+        scriptVerifyFlags |= SCRIPT_VERIFY_CHECKSPHINCSVERIFY;
+    }
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
@@ -2283,6 +2296,17 @@ script_verify_flags GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     // Enforce BIP147 NULLDUMMY (activated simultaneously with segwit)
     if (DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_SEGWIT)) {
         flags |= SCRIPT_VERIFY_NULLDUMMY;
+    }
+
+    // Enforce key-path hardening (BIP 368)
+    if (DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_KEYPATH_HARDENING)) {
+        flags |= SCRIPT_VERIFY_KEYPATH_HARDENING;
+    }
+
+    // Enforce OP_CHECKSPHINCSVERIFY (BIP 369) — requires BIP 368 co-activation
+    if (DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_SPHINCS) &&
+        DeploymentActiveAt(block_index, chainman, Consensus::DEPLOYMENT_KEYPATH_HARDENING)) {
+        flags |= SCRIPT_VERIFY_CHECKSPHINCSVERIFY;
     }
 
     return flags;
