@@ -16,7 +16,11 @@ target_sources(test_bitcoin
     init_tests.cpp
     ismine_tests.cpp
     psbt_wallet_tests.cpp
+    qextkey_tests.cpp
+    qis_descriptor_tests.cpp
     scriptpubkeyman_tests.cpp
+    sphincskeys_db_tests.cpp
+    sphincskeys_tests.cpp
     spend_tests.cpp
     wallet_crypto_tests.cpp
     wallet_rpc_tests.cpp
