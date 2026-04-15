@@ -221,3 +221,10 @@ endfunction()
 add_all_test_targets()
 
 install_binary_component(test_bitcoin INTERNAL)
+
+# SPHINCS+ signer tool for functional testing (BIP 369)
+add_executable(sphincs_signer
+  ${PROJECT_SOURCE_DIR}/test/functional/test_framework/sphincs_signer.cpp
+)
+target_include_directories(sphincs_signer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(sphincs_signer PRIVATE bitcoin_crypto)

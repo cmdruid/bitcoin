@@ -13,6 +13,7 @@
 #include <consensus/validation.h>
 #include <policy/feerate.h>
 #include <primitives/transaction.h>
+#include <script/script.h>
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <script/solver.h>
@@ -325,8 +326,14 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
             // Taproot spend (non-P2SH-wrapped, version 1, witness program size 32; see BIP 341)
             std::span stack{tx.vin[i].scriptWitness.stack};
             if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
-                // Annexes are nonstandard as long as no semantics are defined for them.
-                return false;
+                // BIP 368/369: Allow annexes with known type bytes (0x02 for key-path
+                // hardening, 0x04 for SPHINCS+ signatures). Reject unknown types.
+                const auto& annex = stack.back();
+                if (annex.size() < 2) return false; // Too short
+                uint8_t annex_type = annex[1];
+                if (annex_type != KEYPATH_ANNEX_TYPE && annex_type != SPHINCS_ANNEX_TYPE) {
+                    return false; // Unknown annex type remains nonstandard
+                }
             }
             if (stack.size() >= 2) {
                 // Script path spend (2 or more stack elements after removing optional annex)

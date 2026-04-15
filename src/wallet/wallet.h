@@ -675,6 +675,7 @@ public:
      * @param[in]  bip32derivs whether to fill in bip32 derivation information if available
      * @param[out] n_signed the number of inputs signed by this wallet
      * @param[in] finalize whether to create the final scriptSig or scriptWitness if possible
+     * @param[in] sphincs_emergency force SPHINCS+ script-path signing (emergency quantum spending)
      * return error
      */
     std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbtx,
@@ -683,7 +684,8 @@ public:
                   bool sign = true,
                   bool bip32derivs = true,
                   size_t* n_signed = nullptr,
-                  bool finalize = true) const;
+                  bool finalize = true,
+                  bool sphincs_emergency = false) const;
 
     /**
      * Submit the transaction to the node's mempool and then relay to peers.

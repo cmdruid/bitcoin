@@ -244,6 +244,7 @@ OP_CHECKMULTISIGVERIFY = CScriptOp(0xaf)
 OP_NOP1 = CScriptOp(0xb0)
 OP_CHECKLOCKTIMEVERIFY = CScriptOp(0xb1)
 OP_CHECKSEQUENCEVERIFY = CScriptOp(0xb2)
+OP_CHECKSPHINCSVERIFY = CScriptOp(0xb3)
 OP_NOP4 = CScriptOp(0xb3)
 OP_NOP5 = CScriptOp(0xb4)
 OP_NOP6 = CScriptOp(0xb5)
@@ -362,6 +363,7 @@ OPCODE_NAMES.update({
     OP_NOP1: 'OP_NOP1',
     OP_CHECKLOCKTIMEVERIFY: 'OP_CHECKLOCKTIMEVERIFY',
     OP_CHECKSEQUENCEVERIFY: 'OP_CHECKSEQUENCEVERIFY',
+    OP_CHECKSPHINCSVERIFY: 'OP_CHECKSPHINCSVERIFY',
     OP_NOP4: 'OP_NOP4',
     OP_NOP5: 'OP_NOP5',
     OP_NOP6: 'OP_NOP6',
@@ -858,6 +860,38 @@ def TaprootSignatureMsg(txTo, spent_utxos, hash_type, input_index=0, *, scriptpa
 
 def TaprootSignatureHash(*args, **kwargs):
     return TaggedHash("TapSighash", TaprootSignatureMsg(*args, **kwargs))
+
+def SphincsSignatureMsg(txTo, spent_utxos, input_index=0, *, leaf_script=None, codeseparator_pos=-1, annex=None, leaf_ver=LEAF_VERSION_TAPSCRIPT):
+    """Compute SPHINCS+ sighash message (BIP 369).
+
+    Identical to TaprootSignatureMsg with scriptpath=True, hash_type=0,
+    EXCEPT sha_annex is NOT included (even though spend_type has annex bit set).
+    """
+    assert annex is not None, "SPHINCS+ requires an annex"
+    assert leaf_script is not None, "SPHINCS+ requires scriptpath spend"
+    assert len(txTo.vin) == len(spent_utxos)
+    assert input_index < len(txTo.vin)
+    ss = bytes([0, 0])  # epoch=0, hash_type=SIGHASH_DEFAULT
+    ss += txTo.version.to_bytes(4, "little")
+    ss += txTo.nLockTime.to_bytes(4, "little")
+    ss += BIP341_sha_prevouts(txTo)
+    ss += BIP341_sha_amounts(spent_utxos)
+    ss += BIP341_sha_scriptpubkeys(spent_utxos)
+    ss += BIP341_sha_sequences(txTo)
+    ss += BIP341_sha_outputs(txTo)
+    # spend_type: ext_flag=1 (scriptpath), annex_bit=1 -> 0x03
+    ss += bytes([0x03])
+    ss += input_index.to_bytes(4, "little")
+    # NOTE: sha_annex is NOT appended here (BIP 369)
+    # Tapscript extensions
+    ss += TaggedHash("TapLeaf", bytes([leaf_ver]) + ser_string(leaf_script))
+    ss += bytes([0])  # key_version
+    ss += (codeseparator_pos & 0xffffffff).to_bytes(4, "little", signed=False)
+    return ss
+
+def SphincsSignatureHash(txTo, spent_utxos, input_index=0, **kwargs):
+    """Compute SPHINCS+ sighash (BIP 369)."""
+    return TaggedHash("TapSighash", SphincsSignatureMsg(txTo, spent_utxos, input_index, **kwargs))
 
 def taproot_tree_helper(scripts):
     if len(scripts) == 0:

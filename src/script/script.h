@@ -57,11 +57,23 @@ static const uint32_t LOCKTIME_MAX = 0xFFFFFFFFU;
 // has meanings independent of the script
 static constexpr unsigned int ANNEX_TAG = 0x50;
 
+// BIP 369: SPHINCS+ signature parameters
+static constexpr unsigned int SPHINCS_SIG_SIZE = 4080;
+static constexpr unsigned int SPHINCS_PK_SIZE = 32;
+static constexpr unsigned int KEYPATH_ANNEX_TYPE = 0x02;
+static constexpr unsigned int SPHINCS_ANNEX_TYPE = 0x04;
+
 // Validation weight per passing signature (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PASSED{50};
 
 // How much weight budget is added to the witness size (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_OFFSET{50};
+
+// Validation weight per passing SPHINCS+ signature (BIP 369).
+// SPHINCS+ verification takes ~1,756µs vs ~27µs for Schnorr (~65x).
+// Rounded to 64x for a clean power-of-two multiple.
+// 64 × VALIDATION_WEIGHT_PER_SIGOP_PASSED(50) = 3200.
+static constexpr int64_t VALIDATION_WEIGHT_PER_SPHINCS_SIGOP{3200};
 
 template <typename T>
 std::vector<unsigned char> ToByteVector(const T& in)
@@ -198,7 +210,8 @@ enum opcodetype
     OP_NOP2 = OP_CHECKLOCKTIMEVERIFY,
     OP_CHECKSEQUENCEVERIFY = 0xb2,
     OP_NOP3 = OP_CHECKSEQUENCEVERIFY,
-    OP_NOP4 = 0xb3,
+    OP_CHECKSPHINCSVERIFY = 0xb3,
+    OP_NOP4 = OP_CHECKSPHINCSVERIFY,
     OP_NOP5 = 0xb4,
     OP_NOP6 = 0xb5,
     OP_NOP7 = 0xb6,

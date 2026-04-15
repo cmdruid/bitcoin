@@ -6,6 +6,8 @@
 #include <script/sign.h>
 
 #include <consensus/amount.h>
+#include <crypto/sphincsplus.h>
+#include <hash.h>
 #include <key.h>
 #include <musig.h>
 #include <policy/policy.h>
@@ -61,7 +63,7 @@ bool MutableTransactionSignatureCreator::CreateSig(const SigningProvider& provid
     return true;
 }
 
-std::optional<uint256> MutableTransactionSignatureCreator::ComputeSchnorrSignatureHash(const uint256* leaf_hash, SigVersion sigversion) const
+std::optional<uint256> MutableTransactionSignatureCreator::ComputeSchnorrSignatureHash(const uint256* leaf_hash, SigVersion sigversion, const std::vector<unsigned char>* annex) const
 {
     assert(sigversion == SigVersion::TAPROOT || sigversion == SigVersion::TAPSCRIPT);
 
@@ -72,7 +74,13 @@ std::optional<uint256> MutableTransactionSignatureCreator::ComputeSchnorrSignatu
 
     ScriptExecutionData execdata;
     execdata.m_annex_init = true;
-    execdata.m_annex_present = false; // Only support annex-less signing for now.
+    if (annex) {
+        // BIP 368/369: annex is present — include sha_annex in the Schnorr sighash
+        execdata.m_annex_present = true;
+        execdata.m_annex_hash = (HashWriter{} << *annex).GetSHA256();
+    } else {
+        execdata.m_annex_present = false;
+    }
     if (sigversion == SigVersion::TAPSCRIPT) {
         execdata.m_codeseparator_pos_init = true;
         execdata.m_codeseparator_pos = 0xFFFFFFFF; // Only support non-OP_CODESEPARATOR BIP342 signing for now.
@@ -85,12 +93,30 @@ std::optional<uint256> MutableTransactionSignatureCreator::ComputeSchnorrSignatu
     return hash;
 }
 
-bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const
+std::optional<uint256> MutableTransactionSignatureCreator::ComputeSphincsSignatureHash(const uint256& leaf_hash) const
+{
+    if (!m_txdata || !m_txdata->m_bip341_taproot_ready || !m_txdata->m_spent_outputs_ready) return std::nullopt;
+
+    ScriptExecutionData execdata;
+    execdata.m_annex_init = true;
+    execdata.m_annex_present = true;  // annex bit set (0x03 spend_type) for domain separation
+    // sha_annex intentionally NOT set — BIP 369 breaks the circular dependency
+    execdata.m_tapleaf_hash_init = true;
+    execdata.m_tapleaf_hash = leaf_hash;
+    execdata.m_codeseparator_pos_init = true;
+    execdata.m_codeseparator_pos = 0xFFFFFFFF;
+
+    uint256 hash;
+    if (!SignatureHashSphincs(hash, execdata, m_txto, nIn, *m_txdata, MissingDataBehavior::FAIL)) return std::nullopt;
+    return hash;
+}
+
+bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion, const std::vector<unsigned char>* annex) const
 {
     CKey key;
     if (!provider.GetKeyByXOnly(pubkey, key)) return false;
 
-    std::optional<uint256> hash = ComputeSchnorrSignatureHash(leaf_hash, sigversion);
+    std::optional<uint256> hash = ComputeSchnorrSignatureHash(leaf_hash, sigversion, annex);
     if (!hash.has_value()) return false;
 
     sig.resize(64);
@@ -376,7 +402,9 @@ static bool CreateTaprootScriptSig(const BaseSignatureCreator& creator, Signatur
         return true;
     }
 
-    if (creator.CreateSchnorrSig(provider, sig_out, pubkey, &leaf_hash, nullptr, sigversion)) {
+    // Pass annex to Schnorr sighash if one has been built (BIP 369 two-round signing)
+    const std::vector<unsigned char>* annex_ptr = sigdata.taproot_annex ? &*sigdata.taproot_annex : nullptr;
+    if (creator.CreateSchnorrSig(provider, sig_out, pubkey, &leaf_hash, nullptr, sigversion, annex_ptr)) {
         sigdata.taproot_script_sigs[lookup_key] = sig_out;
     } else if (!SignMuSig2(creator, sigdata, provider, sig_out, pubkey, /*merkle_root=*/nullptr, &leaf_hash, sigversion)) {
         return false;
@@ -556,8 +584,8 @@ static bool SignTaproot(const SigningProvider& provider, const BaseSignatureCrea
     }
 
 
-    // Try key path spending.
-    {
+    // Try key path spending (skip if force_script_path is set for SPHINCS+ emergency spending).
+    if (!sigdata.force_script_path) {
         KeyOriginInfo internal_key_info;
         if (provider.GetKeyOriginByXOnly(sigdata.tr_spenddata.internal_key, internal_key_info)) {
             auto it = sigdata.taproot_misc_pubkeys.find(sigdata.tr_spenddata.internal_key);
@@ -574,22 +602,50 @@ static bool SignTaproot(const SigningProvider& provider, const BaseSignatureCrea
             }
         }
 
-        auto make_keypath_sig = [&](const XOnlyPubKey& pk, const uint256* merkle_root) {
+        // Build BIP 368 key-path annex if we have a valid internal key.
+        // The annex is deterministic from the internal key and optional merkle root.
+        // Format: 0x50 || 0x02 || P (34 bytes) or 0x50 || 0x02 || P || merkle_root (66 bytes)
+        auto build_keypath_annex = [&]() -> std::optional<std::vector<unsigned char>> {
+            const auto& internal_key = sigdata.tr_spenddata.internal_key;
+            if (internal_key.IsNull()) return std::nullopt;
+            std::vector<unsigned char> annex;
+            annex.push_back(ANNEX_TAG);       // 0x50
+            annex.push_back(KEYPATH_ANNEX_TYPE); // 0x02
+            annex.insert(annex.end(), internal_key.begin(), internal_key.end()); // 32-byte P
+            if (!sigdata.tr_spenddata.merkle_root.IsNull()) {
+                annex.insert(annex.end(), sigdata.tr_spenddata.merkle_root.begin(),
+                             sigdata.tr_spenddata.merkle_root.end()); // 32-byte merkle_root
+            }
+            return annex;
+        };
+
+        auto make_keypath_sig = [&](const XOnlyPubKey& pk, const uint256* merkle_root,
+                                    const std::vector<unsigned char>* annex) {
             std::vector<unsigned char> sig;
-            if (creator.CreateSchnorrSig(provider, sig, pk, nullptr, merkle_root, SigVersion::TAPROOT)) {
+            if (creator.CreateSchnorrSig(provider, sig, pk, nullptr, merkle_root, SigVersion::TAPROOT, annex)) {
                 sigdata.taproot_key_path_sig = sig;
             } else {
                 SignMuSig2(creator, sigdata, provider, sig, pk, merkle_root, /*leaf_hash=*/nullptr, SigVersion::TAPROOT);
             }
         };
 
+        // Build the BIP 368 annex only when activation flag is set
+        std::optional<std::vector<unsigned char>> keypath_annex;
+        if (sigdata.taproot_include_annex) {
+            keypath_annex = build_keypath_annex();
+            if (keypath_annex) {
+                sigdata.taproot_annex = *keypath_annex;
+            }
+        }
+        const std::vector<unsigned char>* annex_ptr = keypath_annex ? &*keypath_annex : nullptr;
+
         // First try signing with internal key
         if (sigdata.taproot_key_path_sig.size() == 0) {
-            make_keypath_sig(sigdata.tr_spenddata.internal_key, &sigdata.tr_spenddata.merkle_root);
+            make_keypath_sig(sigdata.tr_spenddata.internal_key, &sigdata.tr_spenddata.merkle_root, annex_ptr);
         }
         // Try signing with output key if still no signature
         if (sigdata.taproot_key_path_sig.size() == 0) {
-            make_keypath_sig(output, nullptr);
+            make_keypath_sig(output, nullptr, annex_ptr);
         }
         if (sigdata.taproot_key_path_sig.size()) {
             result = Vector(sigdata.taproot_key_path_sig);
@@ -598,11 +654,92 @@ static bool SignTaproot(const SigningProvider& provider, const BaseSignatureCrea
     }
 
     // Try script path spending.
+    // BIP 369: When force_script_path is set, clear any pre-existing annex
+    // (e.g., a BIP 368 key-path annex from PSBT creation) so that SPHINCS+
+    // pre-signing can build the correct script-path annex (type 0x04).
+    if (sigdata.force_script_path) {
+        sigdata.taproot_annex.reset();
+    }
     std::vector<std::vector<unsigned char>> smallest_result_stack;
     for (const auto& [key, control_blocks] : sigdata.tr_spenddata.scripts) {
         const auto& [script, leaf_ver] = key;
+
+        // BIP 369: Pre-sign SPHINCS+ for hybrid scripts before TapSatisfier.
+        // The hybrid script has OP_CHECKSPHINCSVERIFY followed by OP_CHECKSIG.
+        // SPHINCS+ must be signed first (sighash excludes sha_annex), then
+        // the annex is built, then Schnorr signs (sighash includes sha_annex).
+        if (sigdata.sphincs_signing_key && sigdata.sphincs_signing_key->size() == 64 && !sigdata.taproot_annex) {
+            // Scan script for OP_CHECKSPHINCSVERIFY
+            bool has_sphincs_opcode = false;
+            for (size_t i = 0; i < script.size(); ++i) {
+                if (script[i] == OP_CHECKSPHINCSVERIFY) {
+                    has_sphincs_opcode = true;
+                    break;
+                }
+            }
+            if (has_sphincs_opcode) {
+                uint256 leaf_hash = ComputeTapleafHash(leaf_ver, script);
+                // Compute BIP 369 SPHINCS+ sighash
+                auto sphincs_hash = dynamic_cast<const MutableTransactionSignatureCreator&>(creator)
+                    .ComputeSphincsSignatureHash(leaf_hash);
+                if (sphincs_hash) {
+                    // Sign with the SPHINCS+ secret key
+                    std::vector<unsigned char> sphincs_sig(SPHINCS_SIG_SIZE);
+                    size_t sig_len = SphincsSign(sphincs_sig.data(),
+                                                sphincs_hash->data(), sphincs_hash->size(),
+                                                sigdata.sphincs_signing_key->data());
+                    if (sig_len == SPHINCS_SIG_SIZE) {
+                        // Build BIP 369 annex: 0x50 || 0x04 || compact_size(1) || sig
+                        std::vector<unsigned char> annex;
+                        annex.push_back(ANNEX_TAG);          // 0x50
+                        annex.push_back(SPHINCS_ANNEX_TYPE); // 0x04
+                        annex.push_back(0x01);               // compact_size(1) = single sig
+                        annex.insert(annex.end(), sphincs_sig.begin(), sphincs_sig.end());
+                        sigdata.taproot_annex = std::move(annex);
+                    }
+                }
+            }
+        }
+
         std::vector<std::vector<unsigned char>> result_stack;
-        if (SignTaprootScript(provider, creator, sigdata, leaf_ver, script, result_stack)) {
+        bool script_signed = SignTaprootScript(provider, creator, sigdata, leaf_ver, script, result_stack);
+
+        // BIP 369: If miniscript can't satisfy the hybrid script (because
+        // OP_CHECKSPHINCSVERIFY is OP_NOP4 which miniscript doesn't recognize),
+        // fall back to direct Schnorr signing for the OP_CHECKSIG portion.
+        //
+        // This fallback only handles the simple hybrid pattern:
+        //   <32-byte sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP <32-byte schnorr_pk> OP_CHECKSIG
+        // Scripts with additional opcodes or multiple OP_CHECKSPHINCSVERIFY
+        // operations require custom signing logic.
+        if (!script_signed && sigdata.force_script_path && sigdata.taproot_annex.has_value()) {
+            CScript cscript(script.begin(), script.end());
+            CScript::const_iterator it = cscript.begin();
+            std::vector<unsigned char> sphincs_pk_data, schnorr_pk_data;
+            opcodetype opcode;
+            opcodetype op1, op2, op_checksig;
+
+            if (cscript.GetOp(it, opcode, sphincs_pk_data) && sphincs_pk_data.size() == 32 &&
+                cscript.GetOp(it, op1) && op1 == OP_CHECKSPHINCSVERIFY &&
+                cscript.GetOp(it, op2) && op2 == OP_DROP &&
+                cscript.GetOp(it, opcode, schnorr_pk_data) && schnorr_pk_data.size() == 32 &&
+                cscript.GetOp(it, op_checksig) && op_checksig == OP_CHECKSIG &&
+                it == cscript.end()) // Ensure no extra opcodes
+            {
+                XOnlyPubKey schnorr_xonly{schnorr_pk_data};
+                if (schnorr_xonly.IsFullyValid()) {
+                    uint256 leaf_hash = ComputeTapleafHash(leaf_ver, script);
+                    std::vector<unsigned char> sig;
+                    const auto* annex_ptr = &*sigdata.taproot_annex;
+                    if (creator.CreateSchnorrSig(provider, sig, schnorr_xonly, &leaf_hash, nullptr, SigVersion::TAPSCRIPT, annex_ptr)) {
+                        result_stack.push_back(std::move(sig));
+                        script_signed = true;
+                    }
+                }
+            }
+        }
+
+        if (script_signed) {
             result_stack.emplace_back(std::begin(script), std::end(script)); // Push the script
             result_stack.push_back(*control_blocks.begin()); // Push the smallest control block
             if (smallest_result_stack.size() == 0 ||
@@ -783,6 +920,10 @@ bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreato
         sigdata.witness = true;
         if (solved) {
             sigdata.scriptWitness.stack = std::move(result);
+            // BIP 341/368/369: append annex as last witness element if present
+            if (sigdata.taproot_annex) {
+                sigdata.scriptWitness.stack.push_back(*sigdata.taproot_annex);
+            }
         }
         result.clear();
     } else if (solved && whichType == TxoutType::WITNESS_UNKNOWN) {
@@ -796,7 +937,16 @@ bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreato
     sigdata.scriptSig = PushAll(result);
 
     // Test solution
-    sigdata.complete = solved && VerifyScript(sigdata.scriptSig, fromPubKey, &sigdata.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, creator.Checker());
+    // Test solution.
+    // For SPHINCS+ emergency script-path, use activation-aware flags:
+    // add CHECKSPHINCSVERIFY and remove DISCOURAGE_UPGRADABLE_NOPS so that
+    // OP_CHECKSPHINCSVERIFY is verified as a real opcode, not rejected as a NOP.
+    auto verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    if (sigdata.force_script_path && sigdata.taproot_annex.has_value()) {
+        verify_flags = (verify_flags | SCRIPT_VERIFY_CHECKSPHINCSVERIFY) & ~SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS;
+    }
+    bool verified = solved && VerifyScript(sigdata.scriptSig, fromPubKey, &sigdata.scriptWitness, verify_flags, creator.Checker());
+    sigdata.complete = verified;
     return sigdata.complete;
 }
 
@@ -959,7 +1109,7 @@ public:
         vchSig[6 + m_r_len + m_s_len] = SIGHASH_ALL;
         return true;
     }
-    bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* tweak, SigVersion sigversion) const override
+    bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* tweak, SigVersion sigversion, const std::vector<unsigned char>* annex = nullptr) const override
     {
         sig.assign(64, '\000');
         return true;

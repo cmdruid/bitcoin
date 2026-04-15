@@ -137,6 +137,14 @@ void PSBTInput::FillSignatureData(SignatureData& sigdata) const
         sigdata.taproot_misc_pubkeys.emplace(pubkey, leaf_origin);
         sigdata.tap_pubkeys.emplace(Hash160(pubkey), pubkey);
     }
+    // SPHINCS+ / annex fields (BIP 377)
+    if (!m_tap_annex.empty()) {
+        sigdata.taproot_annex = m_tap_annex;
+    }
+    for (const auto& [pubkey_leaf, sphincs_pub] : m_tap_sphincs_pubs) {
+        const auto& [xonly, leaf_hash] = pubkey_leaf;
+        sigdata.tr_spenddata.sphincs_keys.emplace(leaf_hash, sphincs_pub);
+    }
     for (const auto& [hash, preimage] : ripemd160_preimages) {
         sigdata.ripemd160_preimages.emplace(std::vector<unsigned char>(hash.begin(), hash.end()), preimage);
     }
@@ -203,6 +211,10 @@ void PSBTInput::FromSignatureData(const SignatureData& sigdata)
     for (const auto& [pubkey, leaf_origin] : sigdata.taproot_misc_pubkeys) {
         m_tap_bip32_paths.emplace(pubkey, leaf_origin);
     }
+    // SPHINCS+ / annex fields (BIP 377)
+    if (sigdata.taproot_annex && !sigdata.taproot_annex->empty()) {
+        m_tap_annex = *sigdata.taproot_annex;
+    }
     m_musig2_participants.insert(sigdata.musig2_pubkeys.begin(), sigdata.musig2_pubkeys.end());
     for (const auto& [agg_key_lh, pubnonces] : sigdata.musig2_pubnonces) {
         m_musig2_pubnonces[agg_key_lh].insert(pubnonces.begin(), pubnonces.end());
@@ -237,6 +249,9 @@ void PSBTInput::Merge(const PSBTInput& input)
     if (m_tap_key_sig.empty() && !input.m_tap_key_sig.empty()) m_tap_key_sig = input.m_tap_key_sig;
     if (m_tap_internal_key.IsNull() && !input.m_tap_internal_key.IsNull()) m_tap_internal_key = input.m_tap_internal_key;
     if (m_tap_merkle_root.IsNull() && !input.m_tap_merkle_root.IsNull()) m_tap_merkle_root = input.m_tap_merkle_root;
+    m_tap_sphincs_pubs.insert(input.m_tap_sphincs_pubs.begin(), input.m_tap_sphincs_pubs.end());
+    m_tap_sphincs_sigs.insert(input.m_tap_sphincs_sigs.begin(), input.m_tap_sphincs_sigs.end());
+    if (m_tap_annex.empty() && !input.m_tap_annex.empty()) m_tap_annex = input.m_tap_annex;
     m_musig2_participants.insert(input.m_musig2_participants.begin(), input.m_musig2_participants.end());
     for (const auto& [agg_key_lh, pubnonces] : input.m_musig2_pubnonces) {
         m_musig2_pubnonces[agg_key_lh].insert(pubnonces.begin(), pubnonces.end());
@@ -344,10 +359,25 @@ bool PSBTInputSignedAndVerified(const PartiallySignedTransaction& psbt, unsigned
         return false;
     }
 
+    // Use activation-aware flags if the witness contains a BIP 369 SPHINCS+ annex.
+    // Detection heuristic: script-path witness has >= 4 elements [sig, script,
+    // control_block, annex]. The annex starts with 0x50 (ANNEX_TAG) and type
+    // byte 0x04 (SPHINCS_ANNEX_TYPE). Key-path witness has <= 2 elements, so
+    // stack.size() >= 4 prevents false positives from key-path annexes.
+    // Without this flag adjustment, OP_CHECKSPHINCSVERIFY (OP_NOP4) would be
+    // rejected by SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS during self-test.
+    auto flags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    if (!input.final_script_witness.IsNull() && input.final_script_witness.stack.size() >= 4) {
+        const auto& last = input.final_script_witness.stack.back();
+        if (last.size() >= 2 && last[0] == 0x50 && last[1] == 0x04) {
+            flags = (flags | SCRIPT_VERIFY_CHECKSPHINCSVERIFY) & ~SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS;
+        }
+    }
+
     if (txdata) {
-        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, STANDARD_SCRIPT_VERIFY_FLAGS, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, *txdata, MissingDataBehavior::FAIL});
+        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, flags, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, *txdata, MissingDataBehavior::FAIL});
     } else {
-        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, STANDARD_SCRIPT_VERIFY_FLAGS, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, MissingDataBehavior::FAIL});
+        return VerifyScript(input.final_script_sig, utxo.scriptPubKey, &input.final_script_witness, flags, MutableTransactionSignatureChecker{&(*psbt.tx), input_index, utxo.nValue, MissingDataBehavior::FAIL});
     }
 }
 
@@ -399,7 +429,7 @@ PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& 
     return txdata;
 }
 
-PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, std::optional<int> sighash,  SignatureData* out_sigdata, bool finalize)
+PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, std::optional<int> sighash,  SignatureData* out_sigdata, bool finalize, const std::vector<unsigned char>* sphincs_secret)
 {
     PSBTInput& input = psbt.inputs.at(index);
     const CMutableTransaction& tx = *psbt.tx;
@@ -411,6 +441,14 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
     // Fill SignatureData with input info
     SignatureData sigdata;
     input.FillSignatureData(sigdata);
+
+    // BIP 369: If a SPHINCS+ signing key is provided, set it on sigdata
+    // so that SignTaproot can pre-sign SPHINCS+ for hybrid tapleaves.
+    // When sphincs_secret is provided, force script-path spending (emergency mode).
+    if (sphincs_secret && sphincs_secret->size() == 64) {
+        sigdata.sphincs_signing_key = *sphincs_secret;
+        sigdata.force_script_path = true;
+    }
 
     // Get UTXO
     bool require_witness_sig = false;

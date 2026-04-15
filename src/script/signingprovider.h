@@ -41,6 +41,10 @@ struct TaprootSpendData
      *  blocks are sorted by size, so that the signing logic can easily
      *  prefer the cheapest one. */
     std::map<std::pair<std::vector<unsigned char>, int>, std::set<std::vector<unsigned char>, ShortestVectorFirstComparator>> scripts;
+    /** Map from leaf hash to SPHINCS+ public key (32 bytes) for leaves that
+     *  contain OP_CHECKSPHINCSVERIFY (qis() descriptors). Used by the signing
+     *  flow to determine which leaves need SPHINCS+ signatures. */
+    std::map<uint256, std::vector<unsigned char>> sphincs_keys;
     /** Merge other TaprootSpendData (for the same scriptPubKey) into this. */
     void Merge(TaprootSpendData other);
 };

@@ -145,6 +145,16 @@ enum class script_verify_flag_name : uint8_t {
     // Making unknown public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
 
+    // Verify key-path internal key disclosure
+    //
+    // See BIP 368 for details.
+    SCRIPT_VERIFY_KEYPATH_HARDENING,
+
+    // Verify OP_CHECKSPHINCSVERIFY
+    //
+    // See BIP 369 for details.
+    SCRIPT_VERIFY_CHECKSPHINCSVERIFY,
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -231,6 +241,17 @@ struct ScriptExecutionData
 
     //! The hash of the corresponding output
     std::optional<uint256> m_output_hash;
+
+    //! Raw annex data (used by BIP 368 key-path hardening and BIP 369 SPHINCS+).
+    bool m_annex_data_init = false;
+    //! Whether the annex has a valid SPHINCS+ format (type_byte 0x04).
+    bool m_sphincs_annex_valid = false;
+    //! Raw annex bytes (including 0x50 prefix).
+    std::vector<uint8_t> m_annex_data;
+    //! Number of SPHINCS+ signatures in annex.
+    uint32_t m_sphincs_sig_count = 0;
+    //! Next signature index to consume.
+    uint32_t m_sphincs_cursor = 0;
 };
 
 /** Signature hash sizes */
@@ -294,6 +315,11 @@ public:
          return false;
     }
 
+    virtual bool CheckSphincsSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const
+    {
+        return false;
+    }
+
     virtual ~BaseSignatureChecker() = default;
 };
 
@@ -308,6 +334,9 @@ enum class MissingDataBehavior
 
 template<typename T>
 bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, uint8_t hash_type, SigVersion sigversion, const PrecomputedTransactionData& cache, MissingDataBehavior mdb);
+
+template<typename T>
+bool SignatureHashSphincs(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, const PrecomputedTransactionData& cache, MissingDataBehavior mdb);
 
 template <class T>
 class GenericTransactionSignatureChecker : public BaseSignatureChecker
@@ -331,6 +360,7 @@ public:
     bool CheckSchnorrSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override;
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;
+    bool CheckSphincsSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;
@@ -361,6 +391,10 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override
     {
         return m_checker.CheckSequence(nSequence);
+    }
+    bool CheckSphincsSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override
+    {
+        return m_checker.CheckSphincsSignature(sig, pubkey, execdata, serror);
     }
 };
 

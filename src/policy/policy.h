@@ -108,6 +108,9 @@ static constexpr script_verify_flags MANDATORY_SCRIPT_VERIFY_FLAGS{SCRIPT_VERIFY
                                                              SCRIPT_VERIFY_CHECKSEQUENCEVERIFY |
                                                              SCRIPT_VERIFY_WITNESS |
                                                              SCRIPT_VERIFY_TAPROOT};
+// Note: SCRIPT_VERIFY_CHECKSPHINCSVERIFY is NOT in MANDATORY or STANDARD flags.
+// It is added dynamically by GetBlockScriptFlags (block validation) and by
+// mempool policy (MemPoolAccept) based on deployment activation state.
 
 /**
  * Standard script verification flags that standard transactions will comply

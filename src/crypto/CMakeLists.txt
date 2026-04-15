@@ -19,6 +19,11 @@ add_library(bitcoin_crypto STATIC EXCLUDE_FROM_ALL
   sha3.cpp
   sha512.cpp
   siphash.cpp
+  sphincsplus.cpp
+  sphincsplus/slh_dsa.c
+  sphincsplus/slh_sha2.c
+  sphincsplus/sha2_256.c
+  sphincsplus/sha2_512.c
   ../support/cleanse.cpp
   ../support/lockedpool.cpp
 )

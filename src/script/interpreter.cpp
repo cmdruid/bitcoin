@@ -8,6 +8,7 @@
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
+#include <crypto/sphincsplus.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <tinyformat.h>
@@ -592,7 +593,68 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     break;
                 }
 
-                case OP_NOP1: case OP_NOP4: case OP_NOP5:
+                case OP_CHECKSPHINCSVERIFY:
+                {
+                    if (!(flags & SCRIPT_VERIFY_CHECKSPHINCSVERIFY)) {
+                        // Not activated; treat as NOP4
+                        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
+                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                        break;
+                    }
+
+                    // BIP 369: SPHINCS+ signature verification from annex
+
+                    // 1. Annex must be present with type byte 0x04 and valid format
+                    if (!execdata.m_annex_data_init || !execdata.m_annex_present)
+                        return set_error(serror, SCRIPT_ERR_SPHINCS_MISSING_ANNEX);
+                    if (!execdata.m_sphincs_annex_valid)
+                        return set_error(serror, SCRIPT_ERR_SPHINCS_BAD_ANNEX_FORMAT);
+
+                    // 2. Peek at top stack element (public key). Do NOT pop (NOP constraint).
+                    if (stack.size() < 1)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+                    const valtype& pk = stacktop(-1);
+
+                    // 3. Check for signatures remaining
+                    if (execdata.m_sphincs_cursor >= execdata.m_sphincs_sig_count)
+                        return set_error(serror, SCRIPT_ERR_SPHINCS_NO_SIG_REMAINING);
+
+                    // 4. Unknown public key type: consume sig slot, skip verification (forward compat)
+                    if (pk.size() != SPHINCS_PK_SIZE) {
+                        execdata.m_sphincs_cursor++;
+                        assert(execdata.m_validation_weight_left_init);
+                        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SPHINCS_SIGOP;
+                        if (execdata.m_validation_weight_left < 0)
+                            return set_error(serror, SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT);
+                        break;
+                    }
+
+                    // 5. Extract signature from annex at cursor position
+                    size_t header_size = execdata.m_annex_data.size() -
+                                         (execdata.m_sphincs_sig_count * SPHINCS_SIG_SIZE);
+                    size_t sig_offset = header_size + (execdata.m_sphincs_cursor * SPHINCS_SIG_SIZE);
+                    if (sig_offset + SPHINCS_SIG_SIZE > execdata.m_annex_data.size()) {
+                        return set_error(serror, SCRIPT_ERR_SPHINCS_BAD_ANNEX_FORMAT);
+                    }
+                    std::span<const unsigned char> sig{
+                        execdata.m_annex_data.data() + sig_offset,
+                        SPHINCS_SIG_SIZE};
+
+                    // 6. Verify SPHINCS+ signature via checker
+                    if (!checker.CheckSphincsSignature(sig, pk, execdata, serror)) {
+                        return false; // serror is set
+                    }
+
+                    // 7. Advance cursor and deduct validation weight
+                    execdata.m_sphincs_cursor++;
+                    assert(execdata.m_validation_weight_left_init);
+                    execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SPHINCS_SIGOP;
+                    if (execdata.m_validation_weight_left < 0)
+                        return set_error(serror, SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT);
+                }
+                break;
+
+                case OP_NOP1: case OP_NOP5:
                 case OP_NOP6: case OP_NOP7: case OP_NOP8: case OP_NOP9: case OP_NOP10:
                 {
                     if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
@@ -1569,6 +1631,63 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
     return true;
 }
 
+/** Compute the BIP 369 SPHINCS+ signature hash.
+ *
+ * Identical to the BIP 342 Tapscript sighash except:
+ * - hash_type is always SIGHASH_DEFAULT (0x00)
+ * - sha_annex is NOT appended (breaks circular dependency)
+ * - spend_type annex bit is still set to 1 (domain separation)
+ */
+template<typename T>
+bool SignatureHashSphincs(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, const PrecomputedTransactionData& cache, MissingDataBehavior mdb)
+{
+    assert(in_pos < tx_to.vin.size());
+    if (!(cache.m_bip341_taproot_ready && cache.m_spent_outputs_ready)) {
+        return HandleMissingData(mdb);
+    }
+
+    HashWriter ss{HASHER_TAPSIGHASH};
+
+    // Epoch
+    static constexpr uint8_t EPOCH = 0;
+    ss << EPOCH;
+
+    // Hash type: always SIGHASH_DEFAULT (0x00) for SPHINCS+
+    const uint8_t hash_type = SIGHASH_DEFAULT;
+    ss << hash_type;
+
+    // Transaction level data (always ALL outputs, never ANYONECANPAY)
+    ss << tx_to.version;
+    ss << tx_to.nLockTime;
+    ss << cache.m_prevouts_single_hash;
+    ss << cache.m_spent_amounts_single_hash;
+    ss << cache.m_spent_scripts_single_hash;
+    ss << cache.m_sequences_single_hash;
+    ss << cache.m_outputs_single_hash;
+
+    // spend_type: ext_flag=1 (Tapscript), annex_bit=1 → 0x03
+    const uint8_t spend_type = 0x03;
+    ss << spend_type;
+
+    // Input index (never ANYONECANPAY)
+    ss << in_pos;
+
+    // NOTE: sha_annex is intentionally NOT appended here (BIP 369).
+    // This breaks the circular dependency where SPHINCS+ signatures
+    // in the annex would be part of their own sighash input.
+
+    // Tapscript extensions
+    assert(execdata.m_tapleaf_hash_init);
+    ss << execdata.m_tapleaf_hash;
+    const uint8_t key_version = 0;
+    ss << key_version;
+    assert(execdata.m_codeseparator_pos_init);
+    ss << execdata.m_codeseparator_pos;
+
+    hash_out = ss.GetSHA256();
+    return true;
+}
+
 int SigHashCache::CacheIndex(int32_t hash_type) const noexcept
 {
     // Note that we do not distinguish between BASE and WITNESS_V0 to determine the cache index,
@@ -1825,6 +1944,22 @@ bool GenericTransactionSignatureChecker<T>::CheckSequence(const CScriptNum& nSeq
     return true;
 }
 
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckSphincsSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, ScriptExecutionData& execdata, ScriptError* serror) const
+{
+    // Compute the SPHINCS+ sighash (BIP 369: Tapscript sighash without sha_annex)
+    uint256 sighash;
+    if (!this->txdata) return HandleMissingData(m_mdb);
+    if (!SignatureHashSphincs(sighash, execdata, *txTo, nIn, *this->txdata, m_mdb)) {
+        return set_error(serror, SCRIPT_ERR_SPHINCS_VERIFY_FAILED);
+    }
+
+    if (!VerifySphincsSignature(pubkey, sig, sighash)) {
+        return set_error(serror, SCRIPT_ERR_SPHINCS_VERIFY_FAILED);
+    }
+    return true;
+}
+
 // explicit instantiation
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
@@ -1862,6 +1997,15 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
 
     // Run the script interpreter.
     if (!EvalScript(stack, exec_script, flags, checker, sigversion, execdata, serror)) return false;
+
+    // BIP 369: All SPHINCS+ signatures in the annex must be consumed (only when activated)
+    if (sigversion == SigVersion::TAPSCRIPT &&
+        (flags & SCRIPT_VERIFY_CHECKSPHINCSVERIFY) &&
+        execdata.m_annex_data_init &&
+        execdata.m_sphincs_annex_valid &&
+        execdata.m_sphincs_cursor != execdata.m_sphincs_sig_count) {
+        return set_error(serror, SCRIPT_ERR_SPHINCS_UNCONSUMED_SIGS);
+    }
 
     // Scripts inside witness implicitly require cleanstack behaviour
     if (stack.size() != 1) return set_error(serror, SCRIPT_ERR_CLEANSTACK);
@@ -1953,10 +2097,75 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             const valtype& annex = SpanPopBack(stack);
             execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
             execdata.m_annex_present = true;
+
+            // BIP 369: Parse SPHINCS+ annex if type byte matches
+            execdata.m_annex_data.assign(annex.begin(), annex.end());
+            execdata.m_annex_data_init = true;
+            if (annex.size() >= 2 && annex[1] == SPHINCS_ANNEX_TYPE) {
+                // Parse compact_size(N) starting at byte 2
+                size_t pos = 2;
+                uint64_t num_sigs = 0;
+                if (pos < annex.size()) {
+                    uint8_t first = annex[pos++];
+                    if (first < 253) {
+                        num_sigs = first;
+                    } else if (first == 253 && pos + 2 <= annex.size()) {
+                        num_sigs = annex[pos] | (uint64_t(annex[pos + 1]) << 8);
+                        pos += 2;
+                    } else if (first == 254 && pos + 4 <= annex.size()) {
+                        num_sigs = annex[pos] | (uint64_t(annex[pos + 1]) << 8) |
+                                   (uint64_t(annex[pos + 2]) << 16) | (uint64_t(annex[pos + 3]) << 24);
+                        pos += 4;
+                    } else { // first == 255 — 8-byte compact_size not supported
+                        return set_error(serror, SCRIPT_ERR_SPHINCS_BAD_ANNEX_FORMAT);
+                    }
+                    // Validate: remaining bytes must be exactly N * SPHINCS_SIG_SIZE
+                    if (annex.size() - pos == num_sigs * SPHINCS_SIG_SIZE) {
+                        execdata.m_sphincs_annex_valid = true;
+                        execdata.m_sphincs_sig_count = static_cast<uint32_t>(num_sigs);
+                    }
+                }
+            }
         } else {
             execdata.m_annex_present = false;
         }
         execdata.m_annex_init = true;
+
+        // BIP 368: Key-path hardening — require internal key disclosure in annex
+        if ((flags & SCRIPT_VERIFY_KEYPATH_HARDENING) && stack.size() == 1) {
+            if (!execdata.m_annex_present) {
+                return set_error(serror, SCRIPT_ERR_KEYPATH_MISSING_ANNEX);
+            }
+            const auto& annex = execdata.m_annex_data;
+            if (annex.size() < 2 || annex[1] != KEYPATH_ANNEX_TYPE) {
+                return set_error(serror, SCRIPT_ERR_KEYPATH_BAD_ANNEX_FORMAT);
+            }
+            if (annex.size() != 34 && annex.size() != 66) {
+                return set_error(serror, SCRIPT_ERR_KEYPATH_BAD_ANNEX_FORMAT);
+            }
+            // Extract internal key P (bytes 2-33)
+            const XOnlyPubKey internal_key{std::span<const unsigned char>{annex.data() + 2, 32}};
+            // NUMS ban
+            if (internal_key == XOnlyPubKey::NUMS_H) {
+                return set_error(serror, SCRIPT_ERR_KEYPATH_NUMS_BANNED);
+            }
+            // Verify tweak: compute Q' = P + tweak(P, merkle_root), compare against Q
+            const uint256* merkle_root_ptr = nullptr;
+            uint256 merkle_root;
+            if (annex.size() == 66) {
+                memcpy(merkle_root.data(), annex.data() + 34, 32);
+                merkle_root_ptr = &merkle_root;
+            }
+            auto tweaked = internal_key.CreateTapTweak(merkle_root_ptr);
+            if (!tweaked) {
+                return set_error(serror, SCRIPT_ERR_KEYPATH_TWEAK_MISMATCH);
+            }
+            const XOnlyPubKey output_key{program};
+            if (tweaked->first != output_key) {
+                return set_error(serror, SCRIPT_ERR_KEYPATH_TWEAK_MISMATCH);
+            }
+        }
+
         if (stack.size() == 1) {
             // Key path spending (stack size is 1 after removing optional annex)
             if (!checker.CheckSchnorrSignature(stack.front(), program, SigVersion::TAPROOT, execdata, serror)) {
@@ -2190,6 +2399,8 @@ const std::map<std::string, script_verify_flag_name>& ScriptFlagNamesToEnum()
         FLAG_NAME(DISCOURAGE_UPGRADABLE_PUBKEYTYPE),
         FLAG_NAME(DISCOURAGE_OP_SUCCESS),
         FLAG_NAME(DISCOURAGE_UPGRADABLE_TAPROOT_VERSION),
+        FLAG_NAME(KEYPATH_HARDENING),
+        FLAG_NAME(CHECKSPHINCSVERIFY),
     };
 #undef FLAG_NAME
     return g_names_to_enum;

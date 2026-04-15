@@ -18,6 +18,7 @@
 #include <script/signingprovider.h>
 #include <util/result.h>
 #include <util/time.h>
+#include <wallet/sphincskeys.h>
 #include <wallet/crypter.h>
 #include <wallet/types.h>
 #include <wallet/walletdb.h>
@@ -138,7 +139,10 @@ public:
     /** Sign a message with the given script */
     virtual SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const { return SigningResult::SIGNING_FAILED; };
     /** Adds script and derivation path information to a PSBT, and optionally signs it. */
-    virtual std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const { return common::PSBTError::UNSUPPORTED; }
+    virtual std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true, bool sphincs_emergency = false) const { return common::PSBTError::UNSUPPORTED; }
+
+    /** Whether this manager holds a SPHINCS+ signing key for emergency spending. */
+    virtual bool HasSphincsKey() const { return false; }
 
     virtual uint256 GetID() const { return uint256(); }
 
@@ -304,6 +308,12 @@ private:
      */
     mutable std::map<uint256, MuSig2SecNonce> m_musig2_secnonces;
 
+    //! SPHINCS+ key for this account (one per descriptor, unencrypted)
+    std::optional<SphincsKey> m_sphincs_key GUARDED_BY(cs_desc_man);
+    //! SPHINCS+ key for this account (encrypted: pubkey + crypted secret)
+    std::optional<std::pair<std::array<unsigned char, 32>,
+                            std::vector<unsigned char>>> m_crypted_sphincs_key GUARDED_BY(cs_desc_man);
+
     bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
@@ -379,7 +389,7 @@ public:
 
     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const override;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const override;
-    std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const override;
+    std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true, bool sphincs_emergency = false) const override;
 
     uint256 GetID() const override;
 
@@ -402,6 +412,27 @@ public:
     [[nodiscard]] bool GetDescriptorString(std::string& out, bool priv) const;
 
     void UpgradeDescriptorCache();
+
+    //! Derive and store a SPHINCS+ key from the master extended key for this account.
+    bool SetupSphincsKey(WalletBatch& batch, const CExtKey& master_key,
+                         const std::vector<uint32_t>& account_path);
+
+    //! Check if a SPHINCS+ key is associated with this descriptor.
+    bool HasSphincsKey() const override;
+
+    //! Get the 32-byte SPHINCS+ public key, if available.
+    std::optional<std::array<unsigned char, 32>> GetSphincsPubkey() const;
+
+    //! Get the SPHINCS+ signing key (decrypting if necessary). Returns nullopt if locked or unavailable.
+    std::optional<SphincsKey> GetSphincsSigningKey() const;
+
+    //! Load an unencrypted SPHINCS+ key (called during wallet load).
+    bool LoadSphincsKey(std::span<const unsigned char> pubkey,
+                        std::span<const unsigned char> secret);
+
+    //! Load an encrypted SPHINCS+ key (called during wallet load).
+    bool LoadCryptedSphincsKey(std::span<const unsigned char> pubkey,
+                               const std::vector<unsigned char>& crypted_secret);
 };
 
 /** struct containing information needed for migrating legacy wallets to descriptor wallets */

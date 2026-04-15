@@ -92,6 +92,8 @@ public:
         consensus.BIP66Height = 363725; // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
         consensus.CSVHeight = 419328; // 000000000000000004a1b34462cb8aeebd5799177f7a29cf28f2d1961716b5b5
         consensus.SegwitHeight = 481824; // 0000000000000000001c8018d9cb3b742ef25114f27563e3fc4a1902167f9893
+        consensus.BIP368Height = std::numeric_limits<int>::max();
+        consensus.BIP369Height = std::numeric_limits<int>::max(); // BIP 369: OP_CHECKSPHINCSVERIFY (not yet activated)
         consensus.MinBIP9WarningHeight = 711648; // taproot activation height + miner confirmation window
         consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
@@ -147,6 +149,8 @@ public:
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,128);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x88, 0xB2, 0x1E};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x88, 0xAD, 0xE4};
+        base58Prefixes[EXT_QI_PUBLIC_KEY] = {0x06, 0x4A, 0x00, 0x00};  // Q1... prefix (110-byte qpub)
+        base58Prefixes[EXT_QI_SECRET_KEY] = {0x15, 0x2C, 0x00, 0x00};  // Q1... prefix (142-byte qprv)
 
         bech32_hrp = "bc";
 
@@ -215,6 +219,8 @@ public:
         consensus.BIP66Height = 330776; // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
         consensus.CSVHeight = 770112; // 00000000025e930139bac5c6c31a403776da130831ab85be56578f3fa75369bb
         consensus.SegwitHeight = 834624; // 00000000002b980fcd729daaa248fd9316a5200e9b367f4ff2c42453e84201ca
+        consensus.BIP368Height = std::numeric_limits<int>::max();
+        consensus.BIP369Height = std::numeric_limits<int>::max();
         consensus.MinBIP9WarningHeight = 2013984; // taproot activation height + miner confirmation window
         consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
@@ -260,6 +266,8 @@ public:
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+        base58Prefixes[EXT_QI_PUBLIC_KEY] = {0x07, 0x20, 0x00, 0x00};  // T4... prefix (testnet qpub)
+        base58Prefixes[EXT_QI_SECRET_KEY] = {0x18, 0x00, 0x00, 0x00};  // T5... prefix (testnet qprv)
 
         bech32_hrp = "tb";
 
@@ -314,6 +322,8 @@ public:
         consensus.BIP66Height = 1;
         consensus.CSVHeight = 1;
         consensus.SegwitHeight = 1;
+        consensus.BIP368Height = std::numeric_limits<int>::max();
+        consensus.BIP369Height = std::numeric_limits<int>::max();
         consensus.MinBIP9WarningHeight = 0;
         consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
@@ -365,6 +375,8 @@ public:
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+        base58Prefixes[EXT_QI_PUBLIC_KEY] = {0x07, 0x20, 0x00, 0x00};  // T4... (testnet qpub)
+        base58Prefixes[EXT_QI_SECRET_KEY] = {0x18, 0x00, 0x00, 0x00};  // T5... (testnet qprv)
 
         bech32_hrp = "tb";
 
@@ -458,6 +470,8 @@ public:
         consensus.BIP66Height = 1;
         consensus.CSVHeight = 1;
         consensus.SegwitHeight = 1;
+        consensus.BIP368Height = std::numeric_limits<int>::max();
+        consensus.BIP369Height = std::numeric_limits<int>::max();
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
         consensus.fPowAllowMinDifficultyBlocks = false;
@@ -506,6 +520,8 @@ public:
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+        base58Prefixes[EXT_QI_PUBLIC_KEY] = {0x07, 0x20, 0x00, 0x00};  // T4... (signet qpub)
+        base58Prefixes[EXT_QI_SECRET_KEY] = {0x18, 0x00, 0x00, 0x00};  // T5... (signet qprv)
 
         bech32_hrp = "tb";
 
@@ -539,6 +555,8 @@ public:
         consensus.BIP66Height = 1;  // Always active unless overridden
         consensus.CSVHeight = 1;    // Always active unless overridden
         consensus.SegwitHeight = 0; // Always active unless overridden
+        consensus.BIP368Height = 1; // Always active unless overridden
+        consensus.BIP369Height = 1; // Always active unless overridden
         consensus.MinBIP9WarningHeight = 0;
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 24 * 60 * 60; // one day
@@ -582,6 +600,12 @@ public:
                 break;
             case Consensus::BuriedDeployment::DEPLOYMENT_CSV:
                 consensus.CSVHeight = int{height};
+                break;
+            case Consensus::BuriedDeployment::DEPLOYMENT_KEYPATH_HARDENING:
+                consensus.BIP368Height = int{height};
+                break;
+            case Consensus::BuriedDeployment::DEPLOYMENT_SPHINCS:
+                consensus.BIP369Height = int{height};
                 break;
             }
         }
@@ -638,6 +662,8 @@ public:
         base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
         base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
         base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+        base58Prefixes[EXT_QI_PUBLIC_KEY] = {0x06, 0x4A, 0x00, 0x00};
+        base58Prefixes[EXT_QI_SECRET_KEY] = {0x15, 0x2C, 0x00, 0x00};
 
         bech32_hrp = "bcrt";
 

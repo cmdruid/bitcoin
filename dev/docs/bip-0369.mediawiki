@@ -1,0 +1,623 @@
+<pre>
+  BIP: 369
+  Layer: Consensus (soft fork)
+  Title: Post-Quantum Signature Verification Using the Taproot Annex in Tapscript
+  Authors: Christopher Scott <cscottdev@protonmail.com>
+  Status: Draft
+  Type: Specification
+  Assigned: 2026-04-02
+  License: BSD-3-Clause
+  Requires: 341, 342
+</pre>
+
+==Introduction==
+
+===Abstract===
+
+This document redefines <code>OP_NOP4</code> (<code>0xB3</code>) in Tapscript ([[bip-0342.mediawiki|BIP 342]]) as <code>OP_CHECKSPHINCSVERIFY</code> for verifying bitcoin-optimized SPHINCS+ signatures carried in the Taproot annex, which is the optional <code>0x50</code>-prefixed witness element defined in [[bip-0341.mediawiki|BIP 341]].
+
+The annex may contain multiple signatures, enabling per-tapleaf multisignature constructs via Taproot MAST. The design supports hybrid Schnorr plus post-quantum scripts as a gradual migration path: non-upgraded nodes treat <code>OP_NOP4</code> as a no-op and still validate all Schnorr signature checks in the same script, while upgraded nodes additionally enforce SPHINCS+ verification.
+
+===Copyright===
+
+This document is licensed under the 3-clause BSD license.
+
+===Motivation===
+
+The Taproot annex ([[bip-0341.mediawiki|BIP 341]]) is reserved for future extensions and is automatically stripped before script execution while being committed to in the sighash. This proposal uses it to carry large SPHINCS+ signatures, approximately 4 KB each, keeping them out of the executing script witness.
+
+Using an <code>OP_NOP4</code> redefinition follows the precedent set by <code>OP_CHECKLOCKTIMEVERIFY</code> ([[bip-0065.mediawiki|BIP 65]]) and <code>OP_CHECKSEQUENCEVERIFY</code> ([[bip-0112.mediawiki|BIP 112]]). Because NOP redefinitions cannot modify the stack, only VERIFY semantics are provided: the opcode peeks at the stack top but does not pop it. The public key must be explicitly dropped afterward with <code>OP_DROP</code>. For k-of-n SPHINCS+ multisignature policies, separate tapleaves via Taproot MAST are used rather than in-script counting.
+
+==Design==
+
+This proposal redefines <code>OP_NOP4</code> as a post-quantum verification opcode for Tapscript, using the Taproot annex as a witness-carried signature container. The annex is already committed to by the Schnorr signature hash yet excluded from the executing stack, which makes it a natural place to transport large signatures.
+
+SPHINCS+ signatures are consumed from the annex in sequence. An internal cursor tracks the next signature to consume. The cursor advances only when an <code>OP_CHECKSPHINCSVERIFY</code> actually executes (not merely present in an unexecuted conditional branch). All signatures in the annex must be consumed by the end of script execution; unconsumed signatures cause validation failure.
+
+===Hybrid Schnorr and SPHINCS+ migration===
+
+The intended migration path is a hybrid script-path spend in which legacy Schnorr checks coexist with SPHINCS+ checks. A representative script template is:
+
+<source>
+<schnorr_pk> OP_CHECKSIGVERIFY
+<sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP
+1
+</source>
+
+Behavior:
+
+* '''Non-upgraded nodes''': <code>OP_NOP4</code> does nothing. <code>OP_CHECKSIGVERIFY</code> validates the Schnorr signature normally. The SPHINCS+ public key is pushed, NOP4 is skipped, <code>OP_DROP</code> removes the public key, and <code>1</code> is the final stack element (true). The Schnorr check is fully enforced.
+* '''Upgraded nodes''': <code>OP_CHECKSIGVERIFY</code> validates the Schnorr signature. <code>OP_CHECKSPHINCSVERIFY</code> peeks at the top stack element (the SPHINCS+ public key), consumes the next signature from the annex, verifies it, and fails the script if verification fails. <code>OP_DROP</code> removes the public key. <code>1</code> is the final stack element.
+
+The Schnorr signature is computed over a standard [[bip-0342.mediawiki|BIP 342]] sighash that includes <code>sha_annex</code>, thereby committing to the exact annex contents including the SPHINCS+ signatures. This prevents annex malleability.
+
+====Signing order====
+
+Because the SPHINCS+ sighash omits <code>sha_annex</code> while the Schnorr sighash includes it, signing must proceed in this order:
+
+# Compute the SPHINCS+ sighash (standard Tapscript sighash without <code>sha_annex</code>; see ''Execution semantics'' below).
+# Create all SPHINCS+ signatures.
+# Build the annex: <code>0x50 || 0x04 || compact_size(N) || sig_1 || sig_2 || ... || sig_N</code>.
+# Compute the Schnorr sighash (standard [[bip-0342.mediawiki|BIP 342]], includes <code>sha_annex</code> which commits to the complete annex).
+# Create the Schnorr signature.
+
+====k-of-n SPHINCS+ multisignature====
+
+Because <code>OP_NOP4</code> redefinitions cannot modify the stack, there is no <code>OP_CHECKSIGADD</code>-style accumulator for SPHINCS+. For k-of-n SPHINCS+ policies, use Taproot MAST: create a separate tapleaf for each acceptable combination of k signers from the n total. Each tapleaf contains k sequential <code>OP_CHECKSPHINCSVERIFY</code> invocations.
+
+For example, a 2-of-3 SPHINCS+ policy produces three tapleaves:
+
+<source>
+Leaf A: <pk1> OP_CHECKSPHINCSVERIFY OP_DROP <pk2> OP_CHECKSPHINCSVERIFY OP_DROP 1
+Leaf B: <pk1> OP_CHECKSPHINCSVERIFY OP_DROP <pk3> OP_CHECKSPHINCSVERIFY OP_DROP 1
+Leaf C: <pk2> OP_CHECKSPHINCSVERIFY OP_DROP <pk3> OP_CHECKSPHINCSVERIFY OP_DROP 1
+</source>
+
+===Soft-fork compatibility===
+
+Non-upgraded nodes treat <code>OP_NOP4</code> as a no-op, so all other script operations (including Schnorr signature checks) execute and are validated normally. This is identical to how <code>OP_CHECKLOCKTIMEVERIFY</code> and <code>OP_CHECKSEQUENCEVERIFY</code> were deployed. Upgraded nodes additionally enforce SPHINCS+ signature verification when <code>OP_NOP4</code> is encountered.
+
+The opcode works in any witness version 1 Taproot script-path spend. Key-path Schnorr spending is unaffected. No changes to addresses or control blocks are required.
+
+Non-upgraded nodes that set the <code>SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS</code> policy flag will reject transactions using this opcode in their mempool, but will accept them in blocks. This is standard behavior for NOP redefinitions.
+
+Annex usage follows the rules and warnings in [[bip-0341.mediawiki|BIP 341]]; premature use of reserved annex semantics risks fund loss.
+
+===Pre-activation usage===
+
+Unlike most soft forks, BIP 369 offers a unique advantage: users can begin protecting their funds '''before''' the soft fork activates. Because <code>OP_NOP4</code> is a valid no-op in Tapscript today, a Taproot output containing a SPHINCS+ tapleaf is valid and spendable on the current network.
+
+The recommended pre-activation strategy is to construct Taproot outputs with a hidden SPHINCS+ tapleaf in the MAST tree. This acts as a ''quantum insurance policy'':
+
+* '''Before activation (normal operation):''' The user spends via key-path (Schnorr) or a Schnorr-based tapleaf. The SPHINCS+ tapleaf is never revealed. The output is indistinguishable from any other Taproot output on-chain.
+* '''If "q-day" occurs''' (a successful quantum computing attack on elliptic curve cryptography): The user's key-path and Schnorr tapleaves become vulnerable. If BIP 369 is activated (potentially via speedy trial under urgency), the SPHINCS+ tapleaf becomes enforceable, and the user can safely spend their funds using post-quantum signatures.
+
+This pre-activation protection is '''zero cost''': the SPHINCS+ tapleaf adds nothing to the on-chain footprint when spending via other paths. The 4 KB SPHINCS+ signature (carried in the annex) is only required at spend time via the SPHINCS+ path, which only happens post-activation.
+
+Users who adopt this strategy before a quantum threat materializes will not need to move their funds after activation — their existing outputs already inherit BIP 369 protections.
+
+===Recommended wallet constructions===
+
+====Full insurance (NUMS internal key)====
+
+For maximum pre-activation protection, use a Nothing Up My Sleeve (NUMS) point as the internal key, with separate Schnorr and SPHINCS+ tapleaves:
+
+<source>
+Internal key: H (NUMS point, e.g., lift_x(0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0))
+MAST tree:
+  Leaf A: <schnorr_pk> OP_CHECKSIGVERIFY 1              (normal spending)
+  Leaf B: <sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP 1   (post-quantum emergency)
+</source>
+
+* '''Normal operation:''' Spend via Leaf A (Schnorr script-path). Cost: ~130 bytes witness (signature + script + control block). Key-path is unspendable by design.
+* '''Post-q-day:''' Activate BIP 369. Spend via Leaf B (SPHINCS+ script-path). Cost: ~4.2 KB witness (annex + script + control block).
+* '''Advantage:''' Key-path spending is already disabled (NUMS), so a quantum attacker who solves ECDLP for the NUMS point gains nothing — there is no key-path to exploit.
+* '''Tradeoff:''' Normal spending uses script-path (~130 bytes) instead of key-path (~64 bytes).
+
+'''Note:''' While the NUMS internal key prevents key-path spending for this specific output, key-path spending for witness v1 outputs in general remains available on the network. Disabling key-path spending globally is outside the scope of this BIP; see [[bip-0360.mediawiki|BIP 360]] for related proposals.
+
+====Combined hybrid leaf====
+
+For post-activation defense-in-depth where both signature types are required simultaneously:
+
+<source>
+Internal key: <schnorr_pk> (key-path available for normal spending)
+MAST tree:
+  Leaf A: <schnorr_pk> OP_CHECKSIGVERIFY <sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP 1
+</source>
+
+* '''Normal operation:''' Spend via key-path (Schnorr, 64 bytes). Most efficient.
+* '''Post-activation:''' Spend via Leaf A requires both valid Schnorr and SPHINCS+ signatures. An attacker must break both simultaneously.
+* '''Tradeoff:''' Key-path remains quantum-vulnerable. This construction provides defense-in-depth post-activation but does not protect against a pre-activation quantum attack on the key-path.
+
+====Choosing a construction====
+
+{| class="wikitable"
+|-
+! Property !! NUMS + separate leaves !! Combined hybrid leaf
+|-
+| Pre-activation quantum insurance || Yes (key-path disabled via NUMS) || No (key-path remains vulnerable)
+|-
+| Normal spending cost || ~130 bytes (script-path) || ~64 bytes (key-path)
+|-
+| Post-activation security || SPHINCS+-only in emergency leaf || Both Schnorr + SPHINCS+ required
+|-
+| Privacy || SPHINCS+ leaf hidden until needed || Script revealed on every spend
+|-
+| Complexity || Two tapleaves || One tapleaf
+|}
+
+For users prioritizing quantum insurance, the NUMS construction is recommended. For users prioritizing spending efficiency who plan to migrate after activation, the combined hybrid leaf is simpler.
+
+==Specification==
+
+===New opcode===
+
+The following opcode is added to Tapscript by redefining a reserved <code>OP_NOP</code> value:
+
+* <code>OP_CHECKSPHINCSVERIFY</code> = <code>0xB3</code> (formerly <code>OP_NOP4</code>)
+
+On nodes that have not activated this BIP, this opcode behaves as <code>OP_NOP4</code>: it has no effect on the stack or control flow, and execution continues to the next opcode. This follows the same upgrade mechanism as <code>OP_CHECKLOCKTIMEVERIFY</code> ([[bip-0065.mediawiki|BIP 65]], redefining <code>OP_NOP2</code>) and <code>OP_CHECKSEQUENCEVERIFY</code> ([[bip-0112.mediawiki|BIP 112]], redefining <code>OP_NOP3</code>).
+
+===Annex format for SPHINCS+ signatures===
+
+When an annex is present (the last witness element starts with <code>0x50</code>), it must begin with a 1-byte type tag after the <code>0x50</code> prefix:
+
+<source>
+0x50 || type_byte || payload
+</source>
+
+For SPHINCS+ signatures, <code>type_byte = 0x04</code> and the payload is:
+
+<source>
+0x50 || 0x04 || compact_size(N) || sig_1 || sig_2 || ... || sig_N
+</source>
+
+* <code>N</code> is a CompactSize-encoded integer indicating the number of SPHINCS+ signatures.
+* Each signature is exactly 4080 bytes.
+* The total annex length must be exactly <code>1 + 1 + compact_size_len(N) + N * 4080</code> bytes. No trailing data is permitted.
+* If the annex is present but does not conform to this format, the script fails on activated nodes.
+* All other type byte values are reserved for future use. An annex with an unrecognized type byte is ignored by this BIP (the <code>OP_CHECKSPHINCSVERIFY</code> opcode fails if no valid SPHINCS+ annex is present).
+
+The annex, including the leading <code>0x50</code>, is removed from the witness stack before execution as defined in [[bip-0341.mediawiki|BIP 341]].
+
+===Annex signature cursor===
+
+An internal per-script-execution cursor tracks the index of the next signature to consume, starting at 0. The cursor advances by one each time an <code>OP_CHECKSPHINCSVERIFY</code> opcode ''executes'' (i.e., is reached during actual execution, not merely present in an unexecuted <code>OP_IF</code>/<code>OP_ELSE</code> branch).
+
+After script execution completes, all <code>N</code> signatures in the annex must have been consumed (cursor == N). If any signatures remain unconsumed, the script fails. This prevents annex bloat via unused signature slots.
+
+Different execution paths through the script may consume different numbers of signatures, provided the annex is constructed with the correct count for the path that will be taken.
+
+===Execution semantics on activated nodes===
+
+====SPHINCS+ sighash====
+
+The SPHINCS+ signature message is computed using the standard [[bip-0342.mediawiki|BIP 342]] Tapscript sighash construction with one modification: <code>sha_annex</code> is not appended, even though the annex-present bit in <code>spend_type</code> is set.
+
+Specifically:
+
+* Use <code>ext_flag = 1</code> (standard Tapscript, as defined in [[bip-0342.mediawiki|BIP 342]]).
+* <code>spend_type = (1 << 1) + 1 = 0x03</code>. The annex-present bit is set to 1 because the annex must be present for SPHINCS+ signatures, providing domain separation from non-annex Tapscript spends.
+* <code>sha_annex</code> is '''not''' appended after the input data. This breaks the circular dependency that would otherwise exist: a signature in the annex cannot be an input to its own sighash.
+* Only <code>hash_type = 0x00</code> (<code>SIGHASH_DEFAULT</code>) is supported. Unlike Schnorr signatures which encode the hash type as an optional trailing byte, SPHINCS+ signatures in the annex are a fixed 4080 bytes with no room for a hash-type suffix. Restricting to default sighash simplifies the design; <code>SIGHASH_ALL</code> is the overwhelmingly common case and <code>SIGHASH_DEFAULT</code> is equivalent to it for Tapscript.
+* <code>OP_CODESEPARATOR</code> updates <code>codesep_pos</code> for the SPHINCS+ sighash identically to its behavior for Schnorr signature checks as defined in [[bip-0342.mediawiki|BIP 342]].
+
+The full SPHINCS+ sighash message is:
+
+<source>
+hashTapSighash(
+  0x00                  // epoch
+  hash_type             // sighash type byte
+  version               // tx version
+  nLockTime             // tx locktime
+  sha_prevouts          // (unless ANYONECANPAY)
+  sha_amounts           // (unless ANYONECANPAY)
+  sha_scriptpubkeys     // (unless ANYONECANPAY)
+  sha_sequences         // (unless ANYONECANPAY)
+  sha_outputs           // (if SIGHASH_ALL)
+  spend_type            // 0x03 (ext_flag=1, annex_bit=1)
+  input_data            // prevout, amount, sequence (ANYONECANPAY) or in_pos
+                        // sha_annex is NOT appended here
+  sha_single_output     // (if SIGHASH_SINGLE)
+  tapleaf_hash          // Tapscript extension
+  key_version           // 0x00
+  codesep_pos           // Tapscript extension
+)
+</source>
+
+The Schnorr sighash used by <code>OP_CHECKSIG</code>, <code>OP_CHECKSIGVERIFY</code>, and <code>OP_CHECKSIGADD</code> in the same script follows the unmodified [[bip-0342.mediawiki|BIP 342]] rules and ''does'' include <code>sha_annex</code>. The Schnorr signature therefore commits to the exact annex contents, preventing malleability.
+
+====OP_CHECKSPHINCSVERIFY====
+
+# If no annex is present, or the annex type byte is not <code>0x04</code>, fail.
+# Peek at the top stack element ''pk''. If the stack is empty, fail.
+# If ''pk'' is not exactly 32 bytes, treat it as an unknown public key type: advance the annex cursor by one (consuming but not verifying the signature) and continue execution. This preserves soft-fork extensibility for future post-quantum schemes with different key sizes.
+# Consume the next 4080-byte signature from the annex at the current cursor position. Fail if no signature remains.
+# Compute the SPHINCS+ sighash as defined above.
+# Verify the signature against ''pk'' and the computed message using the bitcoin-optimized SPHINCS+ parameters defined below.
+# If verification fails, fail the script.
+# If verification succeeds, continue execution. '''The stack is not modified''' (following the NOP-redefinition constraint).
+# Advance the annex cursor by one.
+
+The opcode contributes to the sigops budget identically to a successful Schnorr signature verification (deducting <code>VALIDATION_WEIGHT_PER_SIGOP_PASSED</code> from the validation weight budget).
+
+====Pseudocode: Annex parsing====
+
+<source>
+def ParseSphincsAnnex(annex):
+    if annex[0] != 0x50: return invalid
+    if len(annex) < 2: return invalid
+    if annex[1] != 0x04: return no_sphincs  # unrecognized type byte
+    N = ReadCompactSize(annex, offset=2)
+    header_len = 2 + CompactSizeEncodedLength(N)
+    if len(annex) != header_len + N * 4080:
+        return invalid  # strict length check, no trailing data
+    sigs = []
+    for i in range(N):
+        sigs.append(annex[header_len + i*4080 : header_len + (i+1)*4080])
+    return (N, sigs)
+</source>
+
+====Pseudocode: OP_CHECKSPHINCSVERIFY execution====
+
+<source>
+def Execute_CHECKSPHINCSVERIFY(stack, execdata, flags, checker):
+    if not (flags & SCRIPT_VERIFY_CHECKSPHINCSVERIFY):
+        # Pre-activation: treat as OP_NOP4
+        if flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS:
+            return FAIL(DISCOURAGE_UPGRADABLE_NOPS)
+        return OK
+
+    # Step 1: Annex must be present with type 0x04
+    if not execdata.sphincs_annex_valid:
+        if not execdata.annex_present:
+            return FAIL(SPHINCS_MISSING_ANNEX)
+        return FAIL(SPHINCS_BAD_ANNEX_FORMAT)
+
+    # Step 2: Peek at stack top (do NOT pop)
+    if len(stack) < 1:
+        return FAIL(INVALID_STACK_OPERATION)
+    pk = stack[-1]
+
+    # Step 3: Check signatures remaining
+    if execdata.cursor >= execdata.sig_count:
+        return FAIL(SPHINCS_NO_SIG_REMAINING)
+
+    # Step 4: Unknown key type (forward compatibility)
+    if len(pk) != 32:
+        execdata.cursor += 1
+        execdata.validation_weight -= VALIDATION_WEIGHT_PER_SPHINCS_SIGOP
+        if execdata.validation_weight < 0:
+            return FAIL(TAPSCRIPT_VALIDATION_WEIGHT)
+        return OK
+
+    # Step 5: Extract signature from annex
+    sig = execdata.annex_sig_at(execdata.cursor)  # 4080 bytes
+
+    # Step 6: Compute sighash (BIP 342 minus sha_annex)
+    sighash = SignatureHashSphincs(tx, input_index, execdata)
+
+    # Step 7: Verify SLH-DSA signature
+    if not SLH_DSA_Verify(pk, sig, sighash, BITCOIN_PARAMS):
+        return FAIL(SPHINCS_VERIFY_FAILED)
+
+    # Step 8: Advance cursor and deduct weight
+    execdata.cursor += 1
+    execdata.validation_weight -= VALIDATION_WEIGHT_PER_SPHINCS_SIGOP
+    if execdata.validation_weight < 0:
+        return FAIL(TAPSCRIPT_VALIDATION_WEIGHT)
+    return OK  # Stack is NOT modified (NOP constraint)
+</source>
+
+====Pseudocode: Post-execution unconsumed check====
+
+<source>
+def CheckUnconsumedSignatures(execdata, flags):
+    if not (flags & SCRIPT_VERIFY_CHECKSPHINCSVERIFY):
+        return OK  # not active, skip check
+    if execdata.sphincs_annex_valid and execdata.cursor != execdata.sig_count:
+        return FAIL(SPHINCS_UNCONSUMED_SIGS)
+    return OK
+</source>
+
+===SPHINCS+ parameters===
+
+Verification uses standard <code>SLH-DSA</code> algorithms (WOTS+ and FORS) as defined in [[https://csrc.nist.gov/pubs/fips/205/final|FIPS 205]] with custom tree parameters optimized for Bitcoin's security and size requirements.
+
+====Security level====
+
+* NIST Security Category 1: 128-bit classical / approximately 64-bit quantum.
+
+====Hypertree parameters====
+
+{| class="wikitable"
+|-
+! Parameter !! Value !! Description
+|-
+| n || 16 bytes (128 bits) || Hash output length / security parameter
+|-
+| h || 32 || Full hypertree height (2<sup>32</sup> possible FORS key indices)
+|-
+| d || 4 || Number of hypertree layers
+|-
+| h' = h/d || 8 || Subtree height per layer (XMSS trees with 2<sup>8</sup> = 256 leaves)
+|}
+
+====WOTS+ parameters====
+
+Standard WOTS+ as defined in FIPS 205.
+
+{| class="wikitable"
+|-
+! Parameter !! Value !! Description
+|-
+| w || 256 || Winternitz parameter (base-256 chains)
+|-
+| len1 || 16 || Number of message hash chains (ceil(8n / lg(w)))
+|-
+| len2 || 2 || Number of checksum chains
+|-
+| len || 18 || Total WOTS+ chains per signature (len1 + len2)
+|}
+
+====FORS parameters====
+
+Standard FORS (Forest of Random Subsets) as defined in FIPS 205.
+
+{| class="wikitable"
+|-
+! Parameter !! Value !! Description
+|-
+| k || 10 || Number of FORS trees per signature
+|-
+| a || 14 || FORS tree height (2<sup>14</sup> = 16384 leaves per tree)
+|}
+
+====Key and signature sizes====
+
+{| class="wikitable"
+|-
+! Component !! Size !! Encoding
+|-
+| Public key || 32 bytes || <code>PKseed (16 bytes) || PKroot (16 bytes)</code>
+|-
+| Signature || 4080 bytes || <code>R (16 bytes) || FORS proof (2400 bytes) || d WOTS+ signatures (1152 bytes) || authentication path nodes (512 bytes)</code>
+|}
+
+Signature size breakdown:
+* Randomizer R: n = 16 bytes
+* FORS: k x (a + 1) x n = 10 x 15 x 16 = 2400 bytes
+* WOTS+: d x len x n = 4 x 18 x 16 = 1152 bytes
+* Authentication paths: d x h' x n = 4 x 8 x 16 = 512 bytes
+* Total: 16 + 2400 + 1152 + 512 = 4080 bytes
+
+====Hash function====
+
+All internal hash operations use SHA-256 truncated to n = 16 bytes, with tweakable hash function construction: <code>SHA-256(PKseed || ADRS || message)</code>, where ADRS is a 32-byte address encoding the layer, tree, hash type, and position within the hypertree. Domain separation follows the SLH-DSA specification ([[https://csrc.nist.gov/pubs/fips/205/final|FIPS 205]], Section 10).
+
+====Signature verification====
+
+Given a 32-byte public key, a 4080-byte signature, and a message (the SPHINCS+ sighash defined in this BIP):
+
+# Parse the signature into randomizer R, FORS signature (k trees x (a+1) hashes), d WOTS+ signatures, and d authentication paths.
+# Compute the message digest using H_msg with the randomizer R.
+# Verify the FORS signature: for each of the k = 10 trees, verify the leaf and authentication path against the FORS root.
+# For each of the d = 4 hypertree layers, verify the WOTS+ signature and Merkle authentication path, chaining upward from the FORS root to the hypertree root.
+# Compare the computed root against PKroot from the public key. If they match, verification succeeds; otherwise it fails.
+
+Any malformed encoding (wrong sizes, out-of-range indices, failed hash comparisons) causes verification failure. There are no "soft" failures; any error fails the script.
+
+====Signing limits====
+
+Standard SLH-DSA with these parameters supports 2<sup>32</sup> signatures per key (determined by the hypertree height h = 32). Because a Bitcoin UTXO is spent at most once, this limit has no practical impact. SLH-DSA is a stateless scheme; the signing limit is a theoretical bound on the number of distinct FORS key indices, not a statefulness constraint.
+
+====Reference====
+
+* NIST FIPS 205 (SLH-DSA): [https://csrc.nist.gov/pubs/fips/205/final https://csrc.nist.gov/pubs/fips/205/final]
+* Reference implementation (slhdsa-c): [https://github.com/pq-code-package/slhdsa-c https://github.com/pq-code-package/slhdsa-c]
+
+A reference implementation using the <code>slhdsa-c</code> library with the custom Bitcoin parameter set is provided in the Bitcoin Core branch accompanying this BIP.
+
+==Backward Compatibility==
+
+This proposal is a soft fork. It redefines <code>OP_NOP4</code> in Tapscript as <code>OP_CHECKSPHINCSVERIFY</code>. Non-upgraded nodes treat it as a no-op. This is fully backward compatible, identical to CLTV and CSV deployments.
+
+Hardening of Taproot key-path spending against quantum attacks (internal key disclosure, NUMS point ban, bare-key grace period and rate limiting) is specified separately in [[bip-0368.mediawiki|BIP 368]], which may be activated simultaneously with this BIP.
+
+Existing Taproot outputs are unaffected by this BIP. Key-path spending rules are unchanged; see [[bip-0368.mediawiki|BIP 368]] for key-path modifications.
+
+On non-upgraded nodes, <code>OP_NOP4</code> (<code>0xB3</code>) is treated as a no-op. All other opcodes in the script, including <code>OP_CHECKSIG</code>, <code>OP_CHECKSIGVERIFY</code>, and <code>OP_CHECKSIGADD</code>, execute and are validated normally. A hybrid script such as:
+
+<source>
+<schnorr_pk> OP_CHECKSIGVERIFY
+<sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP
+1
+</source>
+
+is evaluated by non-upgraded nodes as:
+
+<source>
+<schnorr_pk> OP_CHECKSIGVERIFY
+<sphincs_pk> OP_NOP4 OP_DROP
+1
+</source>
+
+The Schnorr signature is fully validated. The SPHINCS+ public key is pushed, the NOP does nothing, <code>OP_DROP</code> removes the public key, and <code>1</code> remains as the truthy final stack element.
+
+Non-upgraded nodes that set the <code>SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS</code> policy flag will reject transactions using this opcode in their mempool, but will accept them in blocks. This is standard behavior for NOP redefinitions.
+
+==Deployment==
+
+This BIP is deployed using the [[bip-0009.mediawiki|BIP 9]] versionbits mechanism, following the precedent of [[bip-0065.mediawiki|BIP 65]] (<code>OP_CHECKLOCKTIMEVERIFY</code>) and [[bip-0112.mediawiki|BIP 112]] (<code>OP_CHECKSEQUENCEVERIFY</code>).
+
+Activation may use the "speedy trial" parameters defined in [[bip-0343.mediawiki|BIP 343]] if deployment coincides with an urgent quantum threat. The speedy trial mechanism allows rapid activation with miner signaling while preserving the option to fail safely if consensus is not reached.
+
+{| class="wikitable"
+|-
+! Parameter !! Value
+|-
+| Consensus deployment name || <code>sphincs</code>
+|-
+| Bit || TBD
+|-
+| Start time || TBD
+|-
+| Timeout || TBD
+|-
+| Minimum activation height || TBD
+|-
+| <code>-testactivationheight</code> parameter || <code>sphincs</code>
+|}
+
+===Activation semantics===
+
+Upon activation at height H:
+
+* <code>OP_NOP4</code> (<code>0xB3</code>) is enforced as <code>OP_CHECKSPHINCSVERIFY</code> in all Tapscript executions.
+* Transactions containing <code>OP_CHECKSPHINCSVERIFY</code> with invalid SPHINCS+ signatures are consensus-invalid in blocks at height H and above.
+* Annex format rules for SPHINCS+ signatures (type byte <code>0x04</code>, strict parsing) are enforced.
+* The <code>SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS</code> policy flag no longer rejects <code>OP_NOP4</code> in the mempool (it is now a defined opcode).
+
+Key-path spending modifications (internal key disclosure, NUMS point ban, bare-key grace period and rate limiting) are specified in [[bip-0368.mediawiki|BIP 368]] and may be activated simultaneously.
+
+===Pre-activation considerations===
+
+Because <code>OP_NOP4</code> is valid in Tapscript today, users may begin creating Taproot outputs with SPHINCS+ tapleaves before activation (see ''Pre-activation usage'' under Design). These outputs are fully spendable via other tapleaves or key-path on the current network. The SPHINCS+ tapleaf becomes enforceable only after activation.
+
+This property makes BIP 369 uniquely suited to proactive quantum risk mitigation: users can secure funds today against a future quantum threat without waiting for the soft fork to activate.
+
+==Resource Limits==
+
+<code>OP_CHECKSPHINCSVERIFY</code> interacts with the [[bip-0342.mediawiki|BIP 342]] per-script validation weight budget as follows:
+
+===Validation weight budget===
+
+The budget is initialized as <code>witness_serialized_size + VALIDATION_WEIGHT_OFFSET</code> (where <code>VALIDATION_WEIGHT_OFFSET = 50</code>). Each successful <code>OP_CHECKSPHINCSVERIFY</code> deducts <code>VALIDATION_WEIGHT_PER_SPHINCS_SIGOP</code> from the budget. If the budget goes negative, the script fails with <code>TAPSCRIPT_VALIDATION_WEIGHT</code>.
+
+The value of <code>VALIDATION_WEIGHT_PER_SPHINCS_SIGOP</code> must reflect the actual CPU cost of SPHINCS+ verification relative to witness weight. SPHINCS+ verification involves thousands of SHA-256 evaluations and is significantly more expensive than Schnorr verification. The production value will be determined by benchmarking; the reference implementation uses a placeholder value pending measurement.
+
+===Annex and stack size limits===
+
+SPHINCS+ signatures (4080 bytes each) are carried in the annex, not on the script stack. They are therefore '''not''' subject to the 520-byte <code>MAX_SCRIPT_ELEMENT_SIZE</code> limit that applies to stack elements. The annex contributes to witness weight but has no independent consensus size limit beyond the overall block weight constraint.
+
+===Maximum signatures per transaction===
+
+Each SPHINCS+ signature adds approximately 4080 bytes to the witness, contributing approximately 1020 weight units (under the segwit 4:1 witness discount). The maximum block weight is 4,000,000 WU. In practice, a single transaction can contain several SPHINCS+ signatures; the limiting factor is the validation weight budget rather than block weight.
+
+For a transaction with a single SPHINCS+ signature: the witness is approximately 4080 (sig) + 100 (script + control block + overhead) = 4180 bytes. The validation weight budget is approximately 4230, which comfortably accommodates the sigop cost.
+
+==Security Considerations==
+
+===Annex malleability===
+
+In hybrid scripts, the Schnorr signature is computed over the standard [[bip-0342.mediawiki|BIP 342]] sighash which includes <code>sha_annex</code>. This commits to the exact annex contents. Any modification to the annex (including the SPHINCS+ signatures it carries) would invalidate the Schnorr signature, preventing third-party malleability.
+
+In SPHINCS+-only scripts (no Schnorr signature), annex malleability is prevented by strict annex parsing: the annex must be exactly <code>0x50 || 0x04 || compact_size(N) || N * 4080 bytes</code> with no trailing data, and all N signatures must be consumed by script execution. There is no room for a malleator to inject or modify data.
+
+===Signing order===
+
+The signing order (SPHINCS+ first, then Schnorr) is a normative requirement. Constructing signatures in the wrong order will produce invalid transactions because the Schnorr sighash depends on <code>sha_annex</code>, which cannot be computed until the SPHINCS+ signatures are known. Wallet implementations must enforce this ordering.
+
+===Circular sighash dependency===
+
+The SPHINCS+ sighash intentionally omits <code>sha_annex</code> to break the circular dependency that would otherwise exist: a signature stored in the annex cannot be computed over a message that includes a hash of itself. The annex-present bit in <code>spend_type</code> remains set to 1 for domain separation, ensuring the SPHINCS+ sighash is distinct from a non-annex Tapscript sighash.
+
+===Hybrid security model===
+
+The hybrid model provides defense in depth: if Schnorr signatures are broken by a quantum adversary, the SPHINCS+ check (enforced on upgraded nodes) prevents unauthorized spending. If the SPHINCS+ scheme is broken, the Schnorr check (enforced on all nodes) prevents unauthorized spending. An attacker must break both simultaneously.
+
+This protection fully applies only after a sufficient portion of the network has upgraded and activated the soft fork. Before activation, non-upgraded nodes enforce only the Schnorr check. This is the same trust model as all prior soft forks: security during transition relies on economic majority enforcement.
+
+===Annex cursor and conditional branches===
+
+The annex cursor advances only on ''executed'' <code>OP_CHECKSPHINCSVERIFY</code> opcodes. Opcodes inside unexecuted <code>OP_IF</code>/<code>OP_ELSE</code> branches do not advance the cursor. Script authors must ensure that the annex is constructed with the correct number of signatures for the execution path that will be taken. All annex signatures must be consumed by the end of execution; unconsumed signatures cause script failure.
+
+===Transaction weight===
+
+Each SPHINCS+ signature adds 4080 bytes to the witness (1020 weight units under the segwit witness discount). A single-signature hybrid transaction adds approximately 4 KB to the witness. Multi-signature constructions via MAST tapleaves add weight proportional to the number of required signers in the chosen tapleaf (k), not the total number of possible signers (n).
+
+===Batch verification===
+
+SPHINCS+ verification involves thousands of hash evaluations per signature and is significantly more expensive than Schnorr verification. Implementations may batch hash computations across multiple SPHINCS+ signatures within the same transaction or block to amortize overhead. However, batch verification must produce the same pass/fail result as individual verification for each signature; batch-specific optimizations must not weaken consensus guarantees.
+
+===Key-path spending and quantum risk===
+
+This BIP does not modify Taproot key-path spending rules. A quantum adversary capable of solving the elliptic curve discrete logarithm problem (ECDLP) can forge Schnorr signatures and key-path spend any witness version 1 output, regardless of whether a SPHINCS+ tapleaf exists in the MAST tree.
+
+To mitigate this risk:
+
+* Users seeking quantum insurance should use a NUMS internal key (see ''Recommended wallet constructions''), which makes key-path spending impossible by construction. Upon activation of [[bip-0368.mediawiki|BIP 368]] (companion proposal), key-path spending with the NUMS point is also banned at the consensus level.
+* [[bip-0368.mediawiki|BIP 368]] specifies key-path witness augmentation (internal key disclosure via annex), NUMS point ban, and bare-key output protection (grace period + rate limiting). It may be activated simultaneously with this BIP for comprehensive post-quantum defense.
+
+===Unknown public key types===
+
+If the top stack element is not exactly 32 bytes, <code>OP_CHECKSPHINCSVERIFY</code> treats it as an unknown key type: the annex cursor advances (consuming a signature slot) but no verification is performed. This preserves soft-fork extensibility for future post-quantum schemes with different key sizes, following the same forward-compatibility pattern as [[bip-0342.mediawiki|BIP 342]] Schnorr key versioning.
+
+==Test Vectors==
+
+Test vectors are provided in [[bip-0369-test-vectors.json]] and include:
+
+* '''Keypair:''' Deterministic key generation from 16-byte seeds, producing a 64-byte secret key and 32-byte public key.
+* '''SPHINCS+ sighash:''' Complete sighash preimage showing all fields, demonstrating that <code>sha_annex</code> is omitted while <code>spend_type</code> retains the annex bit (0x03).
+* '''Signature:''' A valid 4080-byte SLH-DSA signature over the sighash.
+* '''SPHINCS+-only transaction:''' Complete serialized witness for a script-path spend using only <code>OP_CHECKSPHINCSVERIFY</code>.
+* '''Hybrid transaction:''' Complete serialized witness for a Schnorr + SPHINCS+ hybrid spend, demonstrating the signing order (SPHINCS+ first, then Schnorr) and that the Schnorr sighash includes <code>sha_annex</code>.
+* '''Invalid signature:''' A corrupted signature (first byte flipped) that must fail verification.
+* '''Annex format:''' Encoding examples showing the <code>0x50 || 0x04 || compact_size(N) || sig</code> structure.
+
+==Reference Implementation==
+
+A reference implementation is provided on the Bitcoin Core branch accompanying this BIP. It vendors [https://github.com/pq-code-package/slhdsa-c slhdsa-c] (Apache-2.0 / ISC / MIT triple license) into <code>src/crypto/sphincsplus/</code> and defines the custom Bitcoin parameter set (<code>slh_dsa_bitcoin</code>) using standard FIPS 205 algorithms with the tree parameters specified above.
+
+The implementation includes:
+* <code>OP_CHECKSPHINCSVERIFY</code> opcode handler in the script interpreter
+* Annex parsing and signature cursor management
+* <code>SignatureHashSphincs</code> (BIP 342 sighash minus sha_annex)
+* <code>VerifySphincsSignature</code> wrapper for consensus verification
+* Functional tests covering hybrid scripts, SPHINCS+-only scripts, error cases, and multi-signature scenarios
+* Buried deployment activation via <code>-testactivationheight=sphincs@N</code>
+
+==Addendum: Design Rationale for Standard SLH-DSA Algorithms==
+
+===Why standard WOTS+ and FORS instead of W+C_P+FP===
+
+The tree parameters in this BIP (n=16, h=32, d=4, w=256, k=10, a=14) are drawn from "Hash-based Signature Schemes for Bitcoin" (Kudinov and Nick, [https://eprint.iacr.org/2025/2203 ePrint 2025/2203]). That paper also proposes two algorithm-level optimizations that reduce signature size:
+
+* '''WOTS+C''' (Constant-sum WOTS+): eliminates 2 checksum chains per WOTS+ signature by grinding a counter until message digest digits sum to a fixed target. Reduces WOTS+ chains from 18 to 16. See [https://eprint.iacr.org/2022/778 ePrint 2022/778].
+* '''PORS+FP''' (PORS with Fixed Points): replaces k independent FORS trees with a single tree and compact "Octopus" authentication sets. Reduces FORS proof size significantly.
+
+Together, these optimizations would reduce the signature size from 4080 bytes to approximately 3408 bytes.
+
+This BIP uses the '''standard''' FIPS 205 algorithms (WOTS+ with checksum chains, FORS with independent trees) for the following reasons:
+
+====NIST-standardized and well-analyzed====
+
+Standard WOTS+ and FORS are part of FIPS 205, which has undergone extensive public review through the NIST Post-Quantum Cryptography standardization process (2016-2024). The W+C_P+FP optimizations are newer (2022/2025) and have not been through comparable review.
+
+====Same security level====
+
+Both variants target NIST Security Category 1 (128-bit classical / ~64-bit quantum). The standard algorithms are marginally more conservative: WOTS+ checksum chains provide a structural integrity guarantee, and FORS independent trees have simpler security proofs than the Octopus construction.
+
+====Drop-in upgrade path====
+
+The W+C_P+FP variant uses the same hypertree structure (h=32, d=4, h'=8) and the same hash function (SHA-256 truncated to 16 bytes). A future upgrade to the optimized variant would only change the WOTS and FORS internals, not the hypertree traversal, sighash computation, or consensus rules. The upgrade would be a soft fork that tightens the accepted signature size from 4080 to 3408 bytes.
+
+===Signature size comparison===
+
+{| class="wikitable"
+|-
+! Component !! Standard (this BIP) !! W+C_P+FP (future optimization)
+|-
+| Randomizer R || 16 || 16
+|-
+| FORS / PORS proof || 2400 (k x (a+1) x n) || ~1660 (Octopus auth set)
+|-
+| WOTS+ signatures || 1152 (d x 18 x n) || 1024 (d x 16 x n) + 16 (counters)
+|-
+| Auth paths || 512 (d x h' x n) || 512
+|-
+| '''Total''' || '''4080 bytes''' || '''~3408 bytes'''
+|}
+
+The 672-byte difference (16% reduction) is meaningful for transaction weight but does not affect security, consensus rules, or the hybrid deployment model.

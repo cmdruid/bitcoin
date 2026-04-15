@@ -58,6 +58,8 @@ const std::string WALLETDESCRIPTORCACHE{"walletdescriptorcache"};
 const std::string WALLETDESCRIPTORLHCACHE{"walletdescriptorlhcache"};
 const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
+const std::string SPHINCSKEY{"sphincskey"};
+const std::string SPHINCSCKEY{"sphincsckey"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
@@ -228,6 +230,32 @@ bool WalletBatch::WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKe
         return false;
     }
     EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORKEY, std::make_pair(desc_id, pubkey)));
+    return true;
+}
+
+bool WalletBatch::WriteSphincsKey(const uint256& desc_id,
+                                  const std::array<unsigned char, 32>& pubkey,
+                                  const std::array<unsigned char, 64>& secret)
+{
+    // Hash pubkey/secret for integrity check on load
+    std::vector<unsigned char> pubkey_vec(pubkey.begin(), pubkey.end());
+    std::vector<unsigned char> secret_vec(secret.begin(), secret.end());
+    const auto keypair_hash = Hash(pubkey_vec, secret_vec);
+
+    return WriteIC(std::make_pair(DBKeys::SPHINCSKEY, std::make_pair(desc_id, pubkey)),
+                   std::make_pair(secret, keypair_hash), false);
+}
+
+bool WalletBatch::WriteCryptedSphincsKey(const uint256& desc_id,
+                                          const std::array<unsigned char, 32>& pubkey,
+                                          const std::vector<unsigned char>& crypted_secret)
+{
+    if (!WriteIC(std::make_pair(DBKeys::SPHINCSCKEY, std::make_pair(desc_id, pubkey)),
+                 crypted_secret, false)) {
+        return false;
+    }
+    // Remove unencrypted version if it exists
+    EraseIC(std::make_pair(DBKeys::SPHINCSKEY, std::make_pair(desc_id, pubkey)));
     return true;
 }
 
@@ -901,6 +929,59 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
         });
         result = std::max(result, ckey_res.m_result);
         num_ckeys = ckey_res.m_records;
+
+        // Get unencrypted SPHINCS+ keys
+        prefix = PrefixStream(DBKeys::SPHINCSKEY, id);
+        LoadResult sphincs_key_res = LoadRecords(pwallet, batch, DBKeys::SPHINCSKEY, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            uint256 desc_id;
+            std::array<unsigned char, 32> pubkey;
+            key >> desc_id;
+            assert(desc_id == id);
+            key >> pubkey;
+
+            std::array<unsigned char, 64> secret;
+            uint256 hash;
+            value >> secret;
+            value >> hash;
+
+            // Verify integrity hash
+            std::vector<unsigned char> pubkey_vec(pubkey.begin(), pubkey.end());
+            std::vector<unsigned char> secret_vec(secret.begin(), secret.end());
+            const auto keypair_hash = Hash(pubkey_vec, secret_vec);
+            if (keypair_hash != hash) {
+                strErr = "Error reading wallet database: SPHINCS+ key integrity check failed";
+                return DBErrors::CORRUPT;
+            }
+
+            if (!spk_man->LoadSphincsKey(pubkey, secret)) {
+                strErr = "Error reading wallet database: SPHINCS+ key load failed";
+                return DBErrors::CORRUPT;
+            }
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, sphincs_key_res.m_result);
+
+        // Get encrypted SPHINCS+ keys
+        prefix = PrefixStream(DBKeys::SPHINCSCKEY, id);
+        LoadResult sphincs_ckey_res = LoadRecords(pwallet, batch, DBKeys::SPHINCSCKEY, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            uint256 desc_id;
+            std::array<unsigned char, 32> pubkey;
+            key >> desc_id;
+            assert(desc_id == id);
+            key >> pubkey;
+
+            std::vector<unsigned char> crypted_secret;
+            value >> crypted_secret;
+
+            if (!spk_man->LoadCryptedSphincsKey(pubkey, crypted_secret)) {
+                strErr = "Error reading wallet database: encrypted SPHINCS+ key load failed";
+                return DBErrors::CORRUPT;
+            }
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, sphincs_ckey_res.m_result);
 
         return result;
     });

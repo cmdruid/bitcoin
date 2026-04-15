@@ -150,6 +150,11 @@ BASE_SCRIPTS = [
     'feature_config_args.py',
     'wallet_listtransactions.py',
     'wallet_miniscript.py',
+    'feature_sphincs.py',
+    'feature_keypath_hardening.py',
+    'wallet_sphincs.py',
+    'wallet_sphincs_psbt.py',
+    'wallet_sphincs_activation.py',
     # vv Tests less than 30s vv
     'p2p_invalid_messages.py',
     'rpc_createmultisig.py',

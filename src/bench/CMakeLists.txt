@@ -53,6 +53,7 @@ add_executable(bench_bitcoin
   txgraph.cpp
   txorphanage.cpp
   util_time.cpp
+  sphincs.cpp
   verify_script.cpp
 )
 

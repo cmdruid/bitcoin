@@ -1,0 +1,243 @@
+<pre>
+  BIP: 368
+  Layer: Consensus (soft fork)
+  Title: Quantum-Resistant Key-Path Hardening for Taproot
+  Authors: Christopher Scott <cscottdev@protonmail.com>
+  Status: Draft
+  Type: Specification
+  Assigned: 2026-04-02
+  License: BSD-3-Clause
+  Requires: 341
+</pre>
+
+==Introduction==
+
+===Abstract===
+
+This document augments Taproot ([[bip-0341.mediawiki|BIP 341]]) key-path spending to require disclosure of the internal public key via the annex, and bans key-path spending when the internal key matches a known "Nothing Up My Sleeve" (NUMS) point. Outputs constructed without a taproot tweak (bare-key outputs) can no longer be spent via key-path after activation.
+
+This BIP is a companion to [[bip-0369.mediawiki|BIP 369]] (OP_CHECKSPHINCSVERIFY) and may be activated simultaneously. Together, they provide a complete post-quantum defense: BIP 369 enables SPHINCS+ signature verification in Tapscript, while this BIP hardens key-path spending against quantum ECDLP attacks.
+
+===Copyright===
+
+This document is licensed under the 3-clause BSD license.
+
+===Motivation===
+
+Taproot ([[bip-0341.mediawiki|BIP 341]]) key-path spending requires only a Schnorr signature for the output key. A quantum adversary capable of solving the elliptic curve discrete logarithm problem (ECDLP) can forge Schnorr signatures and key-path spend any witness version 1 output, bypassing any post-quantum protections in the script tree.
+
+This is particularly dangerous for outputs constructed with the NUMS internal key recommended in BIP 341. The NUMS point <code>H = lift_x(0x50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0)</code> has an unknown discrete logarithm under classical computation, but a quantum computer can recover it. An attacker could then compute the tweak, derive the private key for the output key <code>Q</code>, and key-path spend — completely bypassing the script tree that may contain post-quantum spending conditions.
+
+This BIP closes that attack vector by requiring the internal key to be disclosed in key-path spends and banning known NUMS points.
+
+==Design==
+
+===Internal key disclosure via annex===
+
+BIP 341 determines key-path vs script-path spending by witness element count: exactly 1 element (after removing the optional annex) is a key-path spend; 2+ elements is a script-path spend. Adding extra witness elements to a key-path spend would break this distinction.
+
+The annex is the natural carrier for the internal key because it is already stripped before the key-path/script-path determination and is committed to in the Schnorr sighash. This BIP defines annex type byte <code>0x02</code> for internal key disclosure.
+
+===NUMS point ban===
+
+The taproot tweak construction <code>Q = P + hash(TapTweak, bytes(P) || ...) * G</code> binds the internal key <code>P</code> to the output key <code>Q</code> through a SHA-256 hash commitment. Even a quantum adversary who can solve ECDLP cannot find an alternative <code>P' != P</code> that produces the same <code>Q</code>, because this would require breaking SHA-256 preimage resistance (128-bit security under Grover's algorithm).
+
+Therefore, requiring <code>P</code> in the witness and verifying it against the tweak formula makes the NUMS ban enforceable: the attacker cannot provide a fake <code>P != H</code> to bypass the ban.
+
+===Bare-key spending is disabled===
+
+====Definition====
+
+A '''bare-key output''' is a witness version 1 (Taproot) output where the output key <code>Q</code> is a raw public key that was '''not''' constructed using the taproot tweak formula. That is, there exists no internal key <code>P</code> and optional merkle root <code>m</code> such that <code>Q = P + hash(TapTweak, bytes(P) || m) * G</code>.
+
+A '''bare-key spend''' is a key-path spend of a bare-key output. Because no tweak was applied, the spender cannot produce an internal key <code>P</code> that reconstructs <code>Q</code> via the tweak formula.
+
+====Rationale for disabling====
+
+Bare-key spending is disabled after activation for the following reasons:
+
+# '''It undermines the security model.''' The entire purpose of this BIP is to require disclosure and verification of the internal key via the taproot tweak. Bare-key outputs bypass this mechanism entirely, making the NUMS ban unenforceable. Any exception for bare-key outputs creates an escape hatch that undermines both this BIP and [[bip-0369.mediawiki|BIP 369]].
+# '''BIP 341 recommends against it.''' The Taproot specification explicitly states: ''"the output key should commit to an unspendable script path instead of having no script path."'' Bare-key outputs are a deviation from the standard.
+# '''Standard wallets do not create them.''' All major wallet implementations apply the taproot tweak when constructing outputs. Bare-key Taproot UTXOs in practice are expected to be negligible.
+# '''The BIP 9 signaling period provides migration time.''' Between the start of miner signaling and the activation height, there are months of advance notice for any bare-key holders to move their funds.
+# '''Bare-key spending can be reinstated.''' If a future need arises, a subsequent BIP can define a mechanism for bare-key spending (for example, requiring a BIP-32 derivation path as proof of key origin, or another preimage-based verification). Disabling now does not permanently confiscate funds — it defers the problem to a purpose-built solution rather than weakening this BIP with a complex exception.
+
+==Specification==
+
+===Annex format for internal key disclosure===
+
+Post-activation, all witness version 1 key-path spends must include an annex carrying the internal public key using type byte <code>0x02</code>:
+
+<source>
+0x50 || 0x02 || P                          (no script tree: 34 bytes total)
+0x50 || 0x02 || P || merkle_root           (with script tree: 66 bytes total)
+</source>
+
+Where <code>P</code> is the 32-byte x-only internal public key and <code>merkle_root</code> is the 32-byte Merkle root of the script tree. No parity byte is needed: the verifier computes the tweaked key from <code>P</code> and compares the x-coordinate directly against the output key <code>Q</code>.
+
+===Key-path spending rules (post-activation)===
+
+Given the output key <code>Q</code> (the 32-byte witness program) and a key-path spend (1 witness element after removing the optional annex):
+
+# If no annex is present, the spend is '''consensus-invalid'''.
+# If an annex is present, it '''must''' have type byte <code>0x02</code> and length exactly 34 or 66 bytes. Any other type byte or length is '''consensus-invalid'''. An annex in a key-path spend has exactly one valid purpose: internal key disclosure.
+# If the annex is <code>0x50 || 0x02 || P</code> (34 bytes): compute <code>(Q', parity) = CreateTapTweak(P, null)</code> using <code>hash(TapTweak, bytes(P))</code> as the tweak.
+# If the annex is <code>0x50 || 0x02 || P || merkle_root</code> (66 bytes): compute <code>(Q', parity) = CreateTapTweak(P, merkle_root)</code> using <code>hash(TapTweak, bytes(P) || merkle_root)</code> as the tweak.
+# If <code>Q' != Q</code> (comparing x-coordinates), the spend is '''consensus-invalid'''. The provided internal key does not match the output key.
+# If <code>P</code> matches any entry in the '''banned NUMS points''' list, the spend is '''consensus-invalid'''. This prevents a quantum adversary from key-path spending outputs constructed with a known unspendable internal key.
+# Verify the Schnorr signature against <code>Q</code> as in [[bip-0341.mediawiki|BIP 341]]. The spend is valid.
+
+====Pseudocode: Key-path annex parsing====
+
+<source>
+def ParseKeypathAnnex(annex):
+    if annex[0] != 0x50: return error
+    if len(annex) < 2: return error
+    if annex[1] != 0x02: return error(BAD_ANNEX_FORMAT)
+    if len(annex) != 34 and len(annex) != 66: return error(BAD_ANNEX_FORMAT)
+    P = annex[2:34]   // 32-byte x-only internal public key
+    if len(annex) == 66:
+        merkle_root = annex[34:66]
+    else:
+        merkle_root = null
+    return (P, merkle_root)
+</source>
+
+====Pseudocode: Key-path verification====
+
+<source>
+def VerifyKeypathHardening(Q, annex_present, annex, flags):
+    if not (flags & KEYPATH_HARDENING):
+        return OK   // pre-activation: no enforcement
+
+    if not annex_present:
+        return error(MISSING_ANNEX)
+
+    (P, merkle_root) = ParseKeypathAnnex(annex)
+
+    // Check banned NUMS points
+    if P in BANNED_NUMS_LIST:
+        return error(NUMS_BANNED)
+
+    // Verify tweak: compute Q' from P, compare against Q
+    (Q', parity) = CreateTapTweak(P, merkle_root)
+    if Q' is null:
+        return error(TWEAK_MISMATCH)   // invalid pubkey
+    if Q'.x != Q.x:
+        return error(TWEAK_MISMATCH)
+
+    return OK   // proceed to Schnorr signature verification
+</source>
+
+===Banned NUMS points===
+
+The following x-only public keys are banned as internal keys for key-path spends. These are well-known "Nothing Up My Sleeve" points whose discrete logarithms are unknown under classical computation but recoverable by a quantum adversary.
+
+{| class="wikitable"
+|-
+! Name !! X-coordinate (hex) !! Construction
+|-
+| BIP 341 NUMS (H) || <code>50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0</code> || <code>lift_x(SHA-256(uncompressed_encoding(G)))</code>, where G is the secp256k1 generator. Defined in [[bip-0341.mediawiki|BIP 341]].
+|}
+
+This list may be extended by future soft forks if additional NUMS constructions become widely adopted. Only points with '''publicly known constructions''' are banned — a point is dangerous precisely because any quantum adversary can target it knowing only the construction recipe.
+
+'''Note on randomized NUMS (H + rG):''' [[bip-0341.mediawiki|BIP 341]] recommends using <code>H + rG</code> for privacy. Randomized variants are '''not''' banned because each has a unique private key that only the creator knows. A quantum attacker must solve ECDLP for each <code>H + rG</code> individually, which is no different from attacking any other public key. Users of randomized NUMS who want quantum protection should migrate to outputs using the exact <code>H</code> point (which is banned from key-path spending, forcing script-path use).
+
+==Deployment==
+
+This BIP is deployed using the [[bip-0009.mediawiki|BIP 9]] versionbits mechanism. It may be activated simultaneously with [[bip-0369.mediawiki|BIP 369]] (OP_CHECKSPHINCSVERIFY) or independently.
+
+Activation may use the "speedy trial" parameters defined in [[bip-0343.mediawiki|BIP 343]] if deployment coincides with an urgent quantum threat.
+
+{| class="wikitable"
+|-
+! Parameter !! Value
+|-
+| Consensus deployment name || <code>taproot-keypath-hardening</code>
+|-
+| Bit || TBD
+|-
+| Start time || TBD
+|-
+| Timeout || TBD
+|-
+| Minimum activation height || TBD
+|}
+
+===Activation semantics===
+
+Upon activation at height H:
+
+* All witness version 1 key-path spends '''must''' include an annex with type byte <code>0x02</code> and length 34 or 66 bytes containing the internal public key.
+* Key-path spends without an annex are '''consensus-invalid'''. This disables bare-key spending.
+* Key-path spends with an annex of any type byte other than <code>0x02</code>, or wrong length, are '''consensus-invalid'''.
+* Key-path spends where the provided internal key does not reconstruct the output key via the taproot tweak are '''consensus-invalid'''.
+* Key-path spends where the verified internal key matches any banned NUMS point are '''consensus-invalid'''.
+
+==Backward Compatibility==
+
+This proposal is a soft fork. It tightens the rules for witness version 1 key-path spending: transactions valid under the new rules are a subset of transactions valid under the old rules.
+
+Non-upgraded nodes ignore the annex contents (the annex is stripped before validation per [[bip-0341.mediawiki|BIP 341]]), so the augmented witness is transparent to them. The additional annex data (34 or 66 bytes) increases transaction weight slightly but does not affect non-upgraded validation.
+
+Existing Taproot outputs:
+* '''Tweaked outputs''' (the vast majority): Key-path spend by including <code>P</code> in the annex. Immediate, no restrictions.
+* '''Bare-key outputs''' (rare, not recommended by BIP 341): '''No longer spendable via key-path''' after activation. Holders must migrate funds before activation. The BIP 9 signaling period provides advance notice.
+
+==Security Considerations==
+
+===SHA-256 preimage resistance===
+
+The security of the NUMS ban relies on SHA-256 preimage resistance, not ECDLP hardness. The taproot tweak <code>hash(TapTweak, bytes(P) || ...)</code> binds <code>P</code> to <code>Q</code>. Finding a <code>P' != P</code> that produces the same <code>Q</code> requires finding a preimage of the tagged hash, which has 128-bit quantum security under Grover's algorithm.
+
+===Randomized NUMS points (H + rG)===
+
+[[bip-0341.mediawiki|BIP 341]] recommends using <code>H + rG</code> (randomized NUMS) for privacy. These randomized variants are '''not''' in the banned NUMS list because:
+
+* Each <code>H + rG</code> has a unique discrete logarithm. A quantum attacker must solve ECDLP for each one individually — no shortcut from knowing <code>H</code>'s construction.
+* The owner knows <code>r</code> and can key-path spend by revealing <code>P = H + rG</code>, which passes the NUMS check.
+* Banning all possible <code>H + rG</code> values is computationally infeasible (the set is the entire curve).
+
+Users who used randomized NUMS and want quantum protection should migrate to new outputs using the '''exact''' <code>H</code> point as internal key (which forces script-path spending).
+
+===Bare-key output impact===
+
+Bare-key outputs (constructed without a taproot tweak) become unspendable via key-path after activation. This is an intentional trade-off:
+
+* [[bip-0341.mediawiki|BIP 341]] explicitly recommends against bare-key outputs.
+* All standard wallet implementations apply the tweak.
+* Bare-key outputs undermine the entire security model of this BIP and [[bip-0369.mediawiki|BIP 369]]: without internal key verification, the NUMS ban is unenforceable.
+* The BIP 9 signaling period provides months of advance notice for migration.
+* Bare-key spending may be reinstated by a future BIP if needed, for example by requiring a BIP-32 derivation proof or other key-origin preimage.
+
+===Interaction with BIP 369===
+
+When deployed alongside [[bip-0369.mediawiki|BIP 369]], the combined protections are:
+
+{| class="wikitable"
+|-
+! Output type !! Key-path !! Script-path !! Quantum protection
+|-
+| NUMS + SPHINCS+ leaf || Banned (NUMS) || SPHINCS+ enforced || Full
+|-
+| Normal key + SPHINCS+ leaf || Allowed (P revealed) || SPHINCS+ enforced || Script-path only
+|-
+| Normal key, no SPHINCS+ || Allowed (P revealed) || Schnorr only || None (quantum-vulnerable)
+|-
+| Bare key || Disabled || N/A (no script tree) || Migrate before activation
+|}
+
+==Test Vectors==
+
+Test vectors are provided in [[bip-0368-test-vectors.json]] and include:
+
+* '''Key-path, no script tree:''' Internal key P, output key Q, 34-byte annex.
+* '''Key-path, with script tree:''' Internal key P, merkle root, output key Q, 66-byte annex.
+* '''NUMS rejection:''' NUMS point H as internal key, expected KEYPATH_NUMS_BANNED error.
+* '''Wrong internal key:''' Mismatched P that doesn't reconstruct Q, expected KEYPATH_TWEAK_MISMATCH error.
+* '''Annex format:''' Valid and invalid annex encoding examples.
+
+==Reference Implementation==
+
+A reference implementation will be provided alongside the [[bip-0369.mediawiki|BIP 369]] reference implementation.
