@@ -56,6 +56,9 @@ static constexpr uint8_t PSBT_IN_TAP_MERKLE_ROOT = 0x18;
 static constexpr uint8_t PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS = 0x1a;
 static constexpr uint8_t PSBT_IN_MUSIG2_PUB_NONCE = 0x1b;
 static constexpr uint8_t PSBT_IN_MUSIG2_PARTIAL_SIG = 0x1c;
+static constexpr uint8_t PSBT_IN_TAP_SPHINCS_PUB = 0x1d;       // BIP 377: SPHINCS+ pubkey per tapleaf
+static constexpr uint8_t PSBT_IN_TAP_SPHINCS_SIG = 0x1e;       // BIP 377: SPHINCS+ signature per tapleaf
+static constexpr uint8_t PSBT_IN_TAP_ANNEX = 0x1f;             // BIP 377: assembled Taproot annex
 static constexpr uint8_t PSBT_IN_PROPRIETARY = 0xFC;
 
 // Output types
@@ -66,6 +69,7 @@ static constexpr uint8_t PSBT_OUT_TAP_INTERNAL_KEY = 0x05;
 static constexpr uint8_t PSBT_OUT_TAP_TREE = 0x06;
 static constexpr uint8_t PSBT_OUT_TAP_BIP32_DERIVATION = 0x07;
 static constexpr uint8_t PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08;
+static constexpr uint8_t PSBT_OUT_TAP_SPHINCS_PUB = 0x09;      // BIP 377: SPHINCS+ pubkey in output tapleaf
 static constexpr uint8_t PSBT_OUT_PROPRIETARY = 0xFC;
 
 // The separator is 0x00. Reading this in means that the unserializer can interpret it
@@ -281,6 +285,11 @@ struct PSBTInput
     XOnlyPubKey m_tap_internal_key;
     uint256 m_tap_merkle_root;
 
+    // SPHINCS+ / annex fields (BIP 377)
+    std::map<std::pair<XOnlyPubKey, uint256>, std::vector<unsigned char>> m_tap_sphincs_pubs;  //!< (xonly, leaf_hash) → 32-byte SPHINCS+ pubkey
+    std::map<std::pair<XOnlyPubKey, uint256>, std::vector<unsigned char>> m_tap_sphincs_sigs;  //!< (xonly, leaf_hash) → 4080-byte SPHINCS+ signature
+    std::vector<unsigned char> m_tap_annex;  //!< Assembled annex (0x50 prefix, type 0x02 or 0x04)
+
     // MuSig2 fields
     std::map<CPubKey, std::vector<CPubKey>> m_musig2_participants;
     // Key is the aggregate pubkey and the script leaf hash, value is a map of participant pubkey to pubnonce
@@ -407,6 +416,26 @@ struct PSBTInput
             if (!m_tap_merkle_root.IsNull()) {
                 SerializeToVector(s, PSBT_IN_TAP_MERKLE_ROOT);
                 SerializeToVector(s, m_tap_merkle_root);
+            }
+
+            // Write SPHINCS+ public keys (BIP 377)
+            for (const auto& [pubkey_leaf, sphincs_pub] : m_tap_sphincs_pubs) {
+                const auto& [xonly, leaf_hash] = pubkey_leaf;
+                SerializeToVector(s, PSBT_IN_TAP_SPHINCS_PUB, xonly, leaf_hash);
+                s << sphincs_pub;
+            }
+
+            // Write SPHINCS+ signatures (BIP 377)
+            for (const auto& [pubkey_leaf, sphincs_sig] : m_tap_sphincs_sigs) {
+                const auto& [xonly, leaf_hash] = pubkey_leaf;
+                SerializeToVector(s, PSBT_IN_TAP_SPHINCS_SIG, xonly, leaf_hash);
+                s << sphincs_sig;
+            }
+
+            // Write taproot annex (BIP 377)
+            if (!m_tap_annex.empty()) {
+                SerializeToVector(s, PSBT_IN_TAP_ANNEX);
+                s << m_tap_annex;
             }
 
             // Write MuSig2 Participants
@@ -788,6 +817,65 @@ struct PSBTInput
                     UnserializeFromVector(s, m_tap_merkle_root);
                     break;
                 }
+                case PSBT_IN_TAP_SPHINCS_PUB:
+                {
+                    if (!key_lookup.emplace(key).second) {
+                        throw std::ios_base::failure("Duplicate Key, input SPHINCS+ public key already provided");
+                    } else if (key.size() != 65) {
+                        throw std::ios_base::failure("Input SPHINCS+ public key key is not 65 bytes");
+                    }
+                    SpanReader s_key{std::span{key}.subspan(1)};
+                    XOnlyPubKey xonly;
+                    uint256 hash;
+                    s_key >> xonly;
+                    s_key >> hash;
+                    std::vector<unsigned char> sphincs_pub;
+                    s >> sphincs_pub;
+                    if (sphincs_pub.size() != 32) {
+                        throw std::ios_base::failure("Input SPHINCS+ public key is not 32 bytes");
+                    }
+                    m_tap_sphincs_pubs.emplace(std::make_pair(xonly, hash), std::move(sphincs_pub));
+                    break;
+                }
+                case PSBT_IN_TAP_SPHINCS_SIG:
+                {
+                    if (!key_lookup.emplace(key).second) {
+                        throw std::ios_base::failure("Duplicate Key, input SPHINCS+ signature already provided");
+                    } else if (key.size() != 65) {
+                        throw std::ios_base::failure("Input SPHINCS+ signature key is not 65 bytes");
+                    }
+                    SpanReader s_key{std::span{key}.subspan(1)};
+                    XOnlyPubKey xonly;
+                    uint256 hash;
+                    s_key >> xonly;
+                    s_key >> hash;
+                    std::vector<unsigned char> sphincs_sig;
+                    s >> sphincs_sig;
+                    if (sphincs_sig.size() != 4080) {
+                        throw std::ios_base::failure("Input SPHINCS+ signature is not 4080 bytes");
+                    }
+                    m_tap_sphincs_sigs.emplace(std::make_pair(xonly, hash), std::move(sphincs_sig));
+                    break;
+                }
+                case PSBT_IN_TAP_ANNEX:
+                {
+                    if (!key_lookup.emplace(key).second) {
+                        throw std::ios_base::failure("Duplicate Key, input Taproot annex already provided");
+                    } else if (key.size() != 1) {
+                        throw std::ios_base::failure("Input Taproot annex key is more than one byte type");
+                    }
+                    // Only basic format checks here (prefix and size limit).
+                    // Type-specific validation (0x02 key-path vs 0x04 SPHINCS+)
+                    // and content validation happen during script execution.
+                    s >> m_tap_annex;
+                    if (m_tap_annex.size() > 100000) { // Policy: ~100KB max (BIP 369 SPHINCS+ annexes are ~8KB)
+                        throw std::ios_base::failure("Input Taproot annex exceeds maximum size");
+                    }
+                    if (!m_tap_annex.empty() && m_tap_annex[0] != 0x50) {
+                        throw std::ios_base::failure("Input Taproot annex must start with 0x50");
+                    }
+                    break;
+                }
                 case PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS:
                 {
                     if (!key_lookup.emplace(key).second) {
@@ -882,6 +970,7 @@ struct PSBTOutput
     XOnlyPubKey m_tap_internal_key;
     std::vector<std::tuple<uint8_t, uint8_t, std::vector<unsigned char>>> m_tap_tree;
     std::map<XOnlyPubKey, std::pair<std::set<uint256>, KeyOriginInfo>> m_tap_bip32_paths;
+    std::map<std::pair<XOnlyPubKey, uint256>, std::vector<unsigned char>> m_tap_sphincs_pubs;  //!< (xonly, leaf_hash) → 32-byte SPHINCS+ pubkey (BIP 377)
     std::map<CPubKey, std::vector<CPubKey>> m_musig2_participants;
     std::map<std::vector<unsigned char>, std::vector<unsigned char>> unknown;
     std::set<PSBTProprietary> m_proprietary;
@@ -943,6 +1032,13 @@ struct PSBTOutput
             s_value << leaf_hashes;
             SerializeKeyOrigin(s_value, origin);
             s << value;
+        }
+
+        // Write SPHINCS+ public keys (BIP 377)
+        for (const auto& [pubkey_leaf, sphincs_pub] : m_tap_sphincs_pubs) {
+            const auto& [xonly, leaf_hash] = pubkey_leaf;
+            SerializeToVector(s, PSBT_OUT_TAP_SPHINCS_PUB, xonly, leaf_hash);
+            s << sphincs_pub;
         }
 
         // Write MuSig2 Participants
@@ -1083,6 +1179,26 @@ struct PSBTOutput
                     }
                     size_t origin_len = value_len - hashes_len;
                     m_tap_bip32_paths.emplace(xonly, std::make_pair(leaf_hashes, DeserializeKeyOrigin(s, origin_len)));
+                    break;
+                }
+                case PSBT_OUT_TAP_SPHINCS_PUB:
+                {
+                    if (!key_lookup.emplace(key).second) {
+                        throw std::ios_base::failure("Duplicate Key, output SPHINCS+ public key already provided");
+                    } else if (key.size() != 65) {
+                        throw std::ios_base::failure("Output SPHINCS+ public key key is not 65 bytes");
+                    }
+                    SpanReader s_key{std::span{key}.subspan(1)};
+                    XOnlyPubKey xonly;
+                    uint256 hash;
+                    s_key >> xonly;
+                    s_key >> hash;
+                    std::vector<unsigned char> sphincs_pub;
+                    s >> sphincs_pub;
+                    if (sphincs_pub.size() != 32) {
+                        throw std::ios_base::failure("Output SPHINCS+ public key is not 32 bytes");
+                    }
+                    m_tap_sphincs_pubs.emplace(std::make_pair(xonly, hash), std::move(sphincs_pub));
                     break;
                 }
                 case PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS:
@@ -1427,7 +1543,7 @@ bool PSBTInputSignedAndVerified(const PartiallySignedTransaction& psbt, unsigned
  * txdata should be the output of PrecomputePSBTData (which can be shared across
  * multiple SignPSBTInput calls). If it is nullptr, a dummy signature will be created.
  **/
-[[nodiscard]] PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, std::optional<int> sighash = std::nullopt, SignatureData* out_sigdata = nullptr, bool finalize = true);
+[[nodiscard]] PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, std::optional<int> sighash = std::nullopt, SignatureData* out_sigdata = nullptr, bool finalize = true, const std::vector<unsigned char>* sphincs_secret = nullptr);
 
 /**  Reduces the size of the PSBT by dropping unnecessary `non_witness_utxos` (i.e. complete previous transactions) from a psbt when all inputs are segwit v1. */
 void RemoveUnnecessaryTransactions(PartiallySignedTransaction& psbtx);

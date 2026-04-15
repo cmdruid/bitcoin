@@ -22,11 +22,14 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   rpc/coins.cpp
   rpc/encrypt.cpp
   rpc/signmessage.cpp
+  rpc/sphincs.cpp
   rpc/spend.cpp
   rpc/transactions.cpp
   rpc/util.cpp
   rpc/wallet.cpp
+  qextkey.cpp
   scriptpubkeyman.cpp
+  sphincskeys.cpp
   spend.cpp
   sqlite.cpp
   transaction.cpp

@@ -1595,6 +1595,7 @@ RPCMethod walletprocesspsbt()
             "       \"SINGLE|ANYONECANPAY\""},
                     {"bip32derivs", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include BIP 32 derivation paths for public keys if we know them"},
                     {"finalize", RPCArg::Type::BOOL, RPCArg::Default{true}, "Also finalize inputs if possible"},
+                    {"sphincs_emergency", RPCArg::Type::BOOL, RPCArg::Default{false}, "Force SPHINCS+ script-path signing for quantum emergency spending. Requires the wallet to hold a SPHINCS+ key."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
@@ -1631,11 +1632,12 @@ RPCMethod walletprocesspsbt()
     bool sign = request.params[1].isNull() ? true : request.params[1].get_bool();
     bool bip32derivs = request.params[3].isNull() ? true : request.params[3].get_bool();
     bool finalize = request.params[4].isNull() ? true : request.params[4].get_bool();
+    bool sphincs_emergency = request.params[5].isNull() ? false : request.params[5].get_bool();
     bool complete = true;
 
     if (sign) EnsureWalletIsUnlocked(*pwallet);
 
-    const auto err{wallet.FillPSBT(psbtx, complete, nHashType, sign, bip32derivs, nullptr, finalize)};
+    const auto err{wallet.FillPSBT(psbtx, complete, nHashType, sign, bip32derivs, nullptr, finalize, sphincs_emergency)};
     if (err) {
         throw JSONRPCPSBTError(*err);
     }

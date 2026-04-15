@@ -2197,7 +2197,7 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
     return false;
 }
 
-std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, std::optional<int> sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize) const
+std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, std::optional<int> sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize, bool sphincs_emergency) const
 {
     if (n_signed) {
         *n_signed = 0;
@@ -2228,15 +2228,32 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
     const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
 
     // Fill in information from ScriptPubKeyMans
-    for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
-        int n_signed_this_spkm = 0;
-        const auto error{spk_man->FillPSBT(psbtx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize)};
-        if (error) {
-            return error;
+    const auto all_spkms = GetAllScriptPubKeyMans();
+    if (sphincs_emergency) {
+        // Two-pass signing: SPHINCS+ SPKMs sign first (script-path) so that
+        // non-QI SPKMs can't key-path sign QI inputs before the QI SPKM runs.
+        for (ScriptPubKeyMan* spk_man : all_spkms) {
+            if (!spk_man->HasSphincsKey()) continue;
+            int n_signed_this_spkm = 0;
+            const auto error{spk_man->FillPSBT(psbtx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, /*sphincs_emergency=*/true)};
+            if (error) return error;
+            if (n_signed) (*n_signed) += n_signed_this_spkm;
         }
-
-        if (n_signed) {
-            (*n_signed) += n_signed_this_spkm;
+        // Second pass: remaining SPKMs (already-signed inputs skipped via PSBTInputSigned)
+        for (ScriptPubKeyMan* spk_man : all_spkms) {
+            if (spk_man->HasSphincsKey()) continue;
+            int n_signed_this_spkm = 0;
+            const auto error{spk_man->FillPSBT(psbtx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, /*sphincs_emergency=*/false)};
+            if (error) return error;
+            if (n_signed) (*n_signed) += n_signed_this_spkm;
+        }
+    } else {
+        // Normal path: single pass, no SPHINCS+ emergency
+        for (ScriptPubKeyMan* spk_man : all_spkms) {
+            int n_signed_this_spkm = 0;
+            const auto error{spk_man->FillPSBT(psbtx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, /*sphincs_emergency=*/false)};
+            if (error) return error;
+            if (n_signed) (*n_signed) += n_signed_this_spkm;
         }
     }
 

@@ -379,6 +379,9 @@ void TaprootSpendData::Merge(TaprootSpendData other)
     for (auto& [key, control_blocks] : other.scripts) {
         scripts[key].merge(std::move(control_blocks));
     }
+    for (auto& [leaf_hash, sphincs_pk] : other.sphincs_keys) {
+        sphincs_keys.emplace(leaf_hash, std::move(sphincs_pk));
+    }
 }
 
 void TaprootBuilder::Insert(TaprootBuilder::NodeInfo&& node, int depth)

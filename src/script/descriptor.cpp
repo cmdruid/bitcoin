@@ -7,6 +7,7 @@
 #include <hash.h>
 #include <key_io.h>
 #include <pubkey.h>
+#include <qextkey.h>
 #include <musig.h>
 #include <script/miniscript.h>
 #include <script/parsing.h>
@@ -1176,6 +1177,54 @@ public:
     }
 };
 
+/** A parsed qis(SPHINCS_HEX, EC_KEY) descriptor — quantum-insured script.
+ *
+ * Expands to the hybrid Tapscript:
+ *   <sphincs_pk> OP_CHECKSPHINCSVERIFY OP_DROP <ec_xonly_pk> OP_CHECKSIG
+ *
+ * The SPHINCS+ public key is a constant 32-byte hex value.
+ * The EC key is a standard key expression (xpub derivation, hex, etc.).
+ * Intended for use as a tapleaf inside tr().
+ *
+ * Note: The EC key expression should use non-hardened derivation when
+ * used with a qpub (watch-only), since hardened children cannot be
+ * derived from an extended public key.
+ */
+class QISDescriptor final : public DescriptorImpl
+{
+private:
+    const std::vector<unsigned char> m_sphincs_pubkey; // 32 bytes, constant
+protected:
+    std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript>, FlatSigningProvider& out) const override
+    {
+        // keys[0] is the EC key (x-only in P2TR context)
+        XOnlyPubKey ec_xonly(keys[0]);
+        CScript script;
+        script << m_sphincs_pubkey << OP_CHECKSPHINCSVERIFY << OP_DROP;
+        script << ToByteVector(ec_xonly) << OP_CHECKSIG;
+        return Vector(std::move(script));
+    }
+    bool ToStringSubScriptHelper(const SigningProvider* arg, std::string& ret, const StringType type, const DescriptorCache* cache = nullptr) const override
+    {
+        return true; // No sub-descriptors to serialize
+    }
+public:
+    QISDescriptor(std::vector<unsigned char> sphincs_pk, std::unique_ptr<PubkeyProvider> ec_prov)
+        : DescriptorImpl(Vector(std::move(ec_prov)), "qis"), m_sphincs_pubkey(std::move(sphincs_pk)) {}
+
+    bool IsSingleType() const final { return true; }
+
+    std::string ToStringExtra() const override
+    {
+        return HexStr(m_sphincs_pubkey);
+    }
+
+    std::unique_ptr<DescriptorImpl> Clone() const override
+    {
+        return std::make_unique<QISDescriptor>(m_sphincs_pubkey, m_pubkey_args.at(0)->Clone());
+    }
+};
+
 /** A parsed pkh(P) descriptor. */
 class PKHDescriptor final : public DescriptorImpl
 {
@@ -1535,6 +1584,138 @@ public:
         subdescs.reserve(m_subdescriptor_args.size());
         std::transform(m_subdescriptor_args.begin(), m_subdescriptor_args.end(), std::back_inserter(subdescs), [](const std::unique_ptr<DescriptorImpl>& d) { return d->Clone(); });
         return std::make_unique<TRDescriptor>(m_pubkey_args.at(0)->Clone(), std::move(subdescs), m_depths);
+    }
+};
+
+/** A parsed qr(qpub) descriptor — quantum-insured Taproot.
+ *
+ * Drop-in replacement for tr() that accepts a qpub extended key and
+ * auto-constructs the hybrid SPHINCS+ tapleaf. The SPHINCS+ public key
+ * is carried in the qpub; the EC key derives per BIP 32 child index.
+ *
+ * qr(qpub/0/[*])         -> single hybrid leaf
+ * qr(qpub/0/[*], {pk(K)}) -> hybrid leaf + user scripts
+ */
+class QRDescriptor final : public DescriptorImpl
+{
+    std::vector<int> m_depths;
+    std::vector<unsigned char> m_sphincs_pubkey; // 32 bytes, from qpub
+protected:
+    std::vector<CScript> MakeScripts(const std::vector<CPubKey>& keys, std::span<const CScript> scripts, FlatSigningProvider& out) const override
+    {
+        assert(keys.size() == 1);
+        XOnlyPubKey xpk(keys[0]);
+        if (!xpk.IsFullyValid()) return {};
+
+        // Build the hybrid SPHINCS+ script
+        CScript hybrid;
+        hybrid << m_sphincs_pubkey << OP_CHECKSPHINCSVERIFY << OP_DROP;
+        hybrid << ToByteVector(xpk) << OP_CHECKSIG;
+
+        TaprootBuilder builder;
+        if (m_depths.empty()) {
+            // No user scripts — just the hybrid leaf at depth 0
+            builder.Add(0, hybrid, TAPROOT_LEAF_TAPSCRIPT);
+        } else {
+            // Hybrid leaf + user scripts as siblings
+            builder.Add(1, hybrid, TAPROOT_LEAF_TAPSCRIPT);
+            for (size_t pos = 0; pos < m_depths.size(); ++pos) {
+                builder.Add(m_depths[pos] + 1, scripts[pos], TAPROOT_LEAF_TAPSCRIPT);
+            }
+        }
+
+        if (!builder.IsComplete()) return {};
+        builder.Finalize(xpk);
+        WitnessV1Taproot output = builder.GetOutput();
+        out.tr_trees[output] = builder;
+        return Vector(GetScriptForDestination(output));
+    }
+    bool ToStringSubScriptHelper(const SigningProvider* arg, std::string& ret, const StringType type, const DescriptorCache* cache = nullptr) const override
+    {
+        if (m_depths.empty()) {
+            return type != StringType::PRIVATE;
+        }
+        // Same tree serialization as TRDescriptor
+        std::vector<bool> path;
+        bool is_private{type == StringType::PRIVATE};
+        bool any_success{!is_private};
+        for (size_t pos = 0; pos < m_depths.size(); ++pos) {
+            if (pos) ret += ',';
+            while ((int)path.size() <= m_depths[pos]) {
+                if (path.size()) ret += '{';
+                path.push_back(false);
+            }
+            std::string tmp;
+            bool subscript_res{m_subdescriptor_args[pos]->ToStringHelper(arg, tmp, type, cache)};
+            if (!is_private && !subscript_res) return false;
+            any_success = any_success || subscript_res;
+            ret += tmp;
+            while (!path.empty() && path.back()) {
+                if (path.size() > 1) ret += '}';
+                path.pop_back();
+            }
+            if (!path.empty()) path.back() = true;
+        }
+        return any_success;
+    }
+    bool ToStringHelper(const SigningProvider* arg, std::string& out, const StringType type, const DescriptorCache* cache = nullptr) const override
+    {
+        Assume(m_pubkey_args.size() == 1);
+        const bool is_private{type == StringType::PRIVATE};
+
+        const auto root_xpub = m_pubkey_args[0]->GetRootExtPubKey();
+        if (!root_xpub.has_value()) {
+            return DescriptorImpl::ToStringHelper(arg, out, type, cache);
+        }
+
+        const std::string key_expr = (type == StringType::NORMALIZED)
+            ? [&]() {
+                std::string normalized;
+                if (!m_pubkey_args[0]->ToNormalizedString(*arg, normalized, cache)) return std::string{};
+                return normalized;
+            }()
+            : m_pubkey_args[0]->ToString(type == StringType::COMPAT ? PubkeyProvider::StringType::COMPAT : PubkeyProvider::StringType::PUBLIC);
+
+        if (key_expr.empty()) return false;
+
+        const std::string root_xpub_str = EncodeExtPubKey(*root_xpub);
+        if (key_expr.rfind(root_xpub_str, 0) != 0) {
+            return DescriptorImpl::ToStringHelper(arg, out, type, cache);
+        }
+
+        QExtPubKey qpub;
+        qpub.extpub = *root_xpub;
+        std::copy(m_sphincs_pubkey.begin(), m_sphincs_pubkey.end(), qpub.sphincs_pubkey.begin());
+
+        std::string ret = "qr(" + EncodeQExtPubKey(qpub) + key_expr.substr(root_xpub_str.size());
+        std::string subscript;
+        bool subscript_res{ToStringSubScriptHelper(arg, subscript, type, cache)};
+        if (!is_private && !subscript_res) return false;
+        if (subscript.size()) ret += "," + subscript;
+        out = std::move(ret) + ")";
+        return !is_private;
+    }
+public:
+    QRDescriptor(std::unique_ptr<PubkeyProvider> internal_key, std::vector<unsigned char> sphincs_pk, std::vector<std::unique_ptr<DescriptorImpl>> descs, std::vector<int> depths) :
+        DescriptorImpl(Vector(std::move(internal_key)), std::move(descs), "qr"), m_depths(std::move(depths)), m_sphincs_pubkey(std::move(sphincs_pk))
+    {
+        assert(m_subdescriptor_args.size() == m_depths.size());
+    }
+    std::optional<OutputType> GetOutputType() const override { return OutputType::BECH32M; }
+    bool IsSingleType() const final { return true; }
+    std::optional<int64_t> ScriptSize() const override { return 1 + 1 + 32; }
+
+    std::string ToStringExtra() const override
+    {
+        return HexStr(m_sphincs_pubkey);
+    }
+
+    std::unique_ptr<DescriptorImpl> Clone() const override
+    {
+        std::vector<std::unique_ptr<DescriptorImpl>> subdescs;
+        subdescs.reserve(m_subdescriptor_args.size());
+        std::transform(m_subdescriptor_args.begin(), m_subdescriptor_args.end(), std::back_inserter(subdescs), [](const std::unique_ptr<DescriptorImpl>& d) { return d->Clone(); });
+        return std::make_unique<QRDescriptor>(m_pubkey_args.at(0)->Clone(), m_sphincs_pubkey, std::move(subdescs), m_depths);
     }
 };
 
@@ -2287,6 +2468,34 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
         }
         return ret;
     }
+    if (ctx == ParseScriptContext::P2TR && Func("qis", expr)) {
+        // qis(SPHINCS_HEX, EC_KEY) — quantum-insured script
+        // First argument: 64-char hex SPHINCS+ public key (constant)
+        auto sphincs_arg = Expr(expr);
+        if (sphincs_arg.empty()) {
+            error = "qis(): expected SPHINCS+ public key hex";
+            return {};
+        }
+        auto sphincs_bytes = ParseHex(std::string(sphincs_arg.begin(), sphincs_arg.end()));
+        if (sphincs_bytes.size() != 32) {
+            error = strprintf("qis(): SPHINCS+ public key must be 32 bytes (64 hex chars), got %d bytes", sphincs_bytes.size());
+            return {};
+        }
+        // Second argument: EC key expression
+        if (!Const(",", expr)) {
+            error = "qis(): expected comma after SPHINCS+ public key";
+            return {};
+        }
+        auto ec_pubkeys = ParsePubkey(key_exp_index, expr, ctx, out, error);
+        if (ec_pubkeys.empty()) {
+            error = strprintf("qis(): %s", error);
+            return {};
+        }
+        for (auto& ec_prov : ec_pubkeys) {
+            ret.emplace_back(std::make_unique<QISDescriptor>(sphincs_bytes, std::move(ec_prov)));
+        }
+        return ret;
+    }
     if ((ctx == ParseScriptContext::TOP || ctx == ParseScriptContext::P2SH || ctx == ParseScriptContext::P2WSH) && Func("pkh", expr)) {
         auto pubkeys = ParsePubkey(key_exp_index, expr, ctx, out, error);
         if (pubkeys.empty()) {
@@ -2554,6 +2763,80 @@ std::vector<std::unique_ptr<DescriptorImpl>> ParseScript(uint32_t& key_exp_index
 
     } else if (Func("tr", expr)) {
         error = "Can only have tr at top level";
+        return {};
+    }
+    if (ctx == ParseScriptContext::TOP && Func("qr", expr)) {
+        // qr(qpub/derivation) or qr(qpub/derivation, {script_tree})
+        auto arg = Expr(expr);
+        std::string key_str(arg.begin(), arg.end());
+
+        std::vector<unsigned char> sphincs_pk;
+        QExtPubKey qpub;
+
+        // Parse as "qpub_base58/derivation" by splitting on first '/'
+        size_t slash_pos = key_str.find('/');
+        std::string base_key = (slash_pos != std::string::npos) ? key_str.substr(0, slash_pos) : key_str;
+        std::string deriv_path = (slash_pos != std::string::npos) ? key_str.substr(slash_pos) : "";
+
+        qpub = DecodeQExtPubKey(base_key);
+        if (!qpub.extpub.pubkey.IsValid()) {
+            QExtKey qprv = DecodeQExtKey(base_key);
+            if (qprv.extkey.key.IsValid()) {
+                sphincs_pk.assign(qprv.sphincs_secret.begin() + 32, qprv.sphincs_secret.end());
+                qpub = qprv.Neuter();
+                out.keys[qprv.extkey.key.GetPubKey().GetID()] = qprv.extkey.key;
+            } else {
+                error = "qr(): invalid qpub/qprv key";
+                return {};
+            }
+        }
+        if (sphincs_pk.empty()) {
+            sphincs_pk.assign(qpub.sphincs_pubkey.begin(), qpub.sphincs_pubkey.end());
+        }
+
+        // Reconstruct xpub string with derivation path for standard key parsing
+        key_str = EncodeExtPubKey(qpub.extpub) + deriv_path;
+
+        // Parse the EC key using standard xpub parsing
+        std::span<const char> key_span{key_str.data(), key_str.size()};
+        auto ec_keys = ParsePubkey(key_exp_index, key_span, ParseScriptContext::P2TR, out, error);
+        if (ec_keys.empty()) {
+            error = strprintf("qr(): %s", error);
+            return {};
+        }
+
+        // Parse optional script tree (same as tr())
+        std::vector<std::vector<std::unique_ptr<DescriptorImpl>>> subscripts;
+        std::vector<int> depths;
+        if (expr.size()) {
+            if (!Const(",", expr)) {
+                error = strprintf("qr(): expected ',' after key expression");
+                return {};
+            }
+            // Parse script tree same as tr() — simplified: single script for now
+            auto sarg = Expr(expr);
+            subscripts.emplace_back(ParseScript(key_exp_index, sarg, ParseScriptContext::P2TR, out, error));
+            if (subscripts.back().empty()) {
+                error = strprintf("qr(): %s", error);
+                return {};
+            }
+            depths.push_back(0);
+        }
+
+        // Build QRDescriptor(s)
+        for (size_t i = 0; i < ec_keys.size(); ++i) {
+            std::vector<std::unique_ptr<DescriptorImpl>> this_subs;
+            for (size_t j = 0; j < subscripts.size(); ++j) {
+                if (subscripts[j].size() > i) {
+                    this_subs.emplace_back(std::move(subscripts[j][i]));
+                }
+            }
+            ret.emplace_back(std::make_unique<QRDescriptor>(std::move(ec_keys[i]), sphincs_pk, std::move(this_subs), depths));
+        }
+        return ret;
+
+    } else if (Func("qr", expr)) {
+        error = "Can only have qr at top level";
         return {};
     }
     if (ctx == ParseScriptContext::TOP && Func("rawtr", expr)) {

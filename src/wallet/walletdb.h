@@ -82,6 +82,8 @@ extern const std::string VERSION;
 extern const std::string WALLETDESCRIPTOR;
 extern const std::string WALLETDESCRIPTORCKEY;
 extern const std::string WALLETDESCRIPTORKEY;
+extern const std::string SPHINCSKEY;
+extern const std::string SPHINCSCKEY;
 extern const std::string WATCHMETA;
 extern const std::string WATCHS;
 
@@ -245,6 +247,14 @@ public:
 
     bool WriteDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const CPrivKey& privkey);
     bool WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const std::vector<unsigned char>& secret);
+    //! Write an unencrypted SPHINCS+ key associated with a descriptor.
+    bool WriteSphincsKey(const uint256& desc_id,
+                         const std::array<unsigned char, 32>& pubkey,
+                         const std::array<unsigned char, 64>& secret);
+    //! Write an encrypted SPHINCS+ key associated with a descriptor.
+    bool WriteCryptedSphincsKey(const uint256& desc_id,
+                                const std::array<unsigned char, 32>& pubkey,
+                                const std::vector<unsigned char>& crypted_secret);
     bool WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor);
     bool WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index);
     bool WriteDescriptorParentCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);

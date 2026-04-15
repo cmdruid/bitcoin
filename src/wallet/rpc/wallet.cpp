@@ -843,6 +843,16 @@ static RPCMethod createwalletdescriptor()
 // addresses
 RPCMethod getaddressinfo();
 RPCMethod getnewaddress();
+
+// sphincs / quantum-insured
+RPCMethod createsphincskey();
+RPCMethod getquantumaddress();
+RPCMethod exportqpub();
+RPCMethod importqpub();
+RPCMethod exportqprv();
+RPCMethod importqprv();
+RPCMethod listsphincskeys();
+RPCMethod sphincsspend();
 RPCMethod getrawchangeaddress();
 RPCMethod setlabel();
 RPCMethod listaddressgroupings();
@@ -918,13 +928,21 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getaddressinfo},
         {"wallet", &getbalance},
         {"wallet", &gethdkeys},
+        {"wallet", &createsphincskey},
         {"wallet", &getnewaddress},
+        {"wallet", &getquantumaddress},
         {"wallet", &getrawchangeaddress},
         {"wallet", &getreceivedbyaddress},
         {"wallet", &getreceivedbylabel},
         {"wallet", &gettransaction},
         {"wallet", &getbalances},
         {"wallet", &getwalletinfo},
+        {"wallet", &exportqpub},
+        {"wallet", &importqpub},
+        {"wallet", &exportqprv},
+        {"wallet", &importqprv},
+        {"wallet", &listsphincskeys},
+        {"wallet", &sphincsspend},
         {"wallet", &importdescriptors},
         {"wallet", &importprunedfunds},
         {"wallet", &keypoolrefill},

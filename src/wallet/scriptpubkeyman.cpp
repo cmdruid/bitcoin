@@ -1306,7 +1306,7 @@ SigningResult DescriptorScriptPubKeyMan::SignMessage(const std::string& message,
     return SigningResult::OK;
 }
 
-std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const
+std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize, bool sphincs_emergency) const
 {
     if (n_signed) {
         *n_signed = 0;
@@ -1376,7 +1376,20 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
             }
         }
 
-        PSBTError res = SignPSBTInput(HidingSigningProvider(keys.get(), /*hide_secret=*/!sign, /*hide_origin=*/!bip32derivs), psbtx, i, &txdata, sighash_type, nullptr, finalize);
+        // BIP 369: SPHINCS+ key is NOT passed by default — key-path spending
+        // is preferred for normal operation. The SPHINCS+ key is only passed
+        // when sphincs_emergency is set (e.g., via sphincsspend RPC), which
+        // triggers force_script_path and the SPHINCS+ emergency signing flow.
+        const std::vector<unsigned char>* sphincs_ptr = nullptr;
+        std::vector<unsigned char> sphincs_secret_vec;
+        if (sphincs_emergency) {
+            auto sk = GetSphincsSigningKey();
+            if (sk) {
+                sphincs_secret_vec.assign(sk->SecretData(), sk->SecretData() + 64);
+                sphincs_ptr = &sphincs_secret_vec;
+            }
+        }
+        PSBTError res = SignPSBTInput(HidingSigningProvider(keys.get(), /*hide_secret=*/!sign, /*hide_origin=*/!bip32derivs), psbtx, i, &txdata, sighash_type, nullptr, finalize, sphincs_ptr);
         if (res != PSBTError::OK && res != PSBTError::INCOMPLETE) {
             return res;
         }
@@ -1607,4 +1620,131 @@ bool DescriptorScriptPubKeyMan::CanUpdateToWalletDescriptor(const WalletDescript
 
     return true;
 }
+
+bool DescriptorScriptPubKeyMan::SetupSphincsKey(WalletBatch& batch, const CExtKey& master_key,
+                                                 const std::vector<uint32_t>& account_path)
+{
+    LOCK(cs_desc_man);
+
+    // Don't overwrite an existing SPHINCS+ key
+    if (m_sphincs_key.has_value() || m_crypted_sphincs_key.has_value()) {
+        return false;
+    }
+
+    SphincsKey sk = SphincsKey::DeriveFromMaster(master_key, account_path);
+    if (!sk.IsValid()) {
+        return false;
+    }
+
+    // Store pubkey as fixed-size array for DB operations
+    std::array<unsigned char, 32> pubkey_arr;
+    std::copy(sk.PubkeyData(), sk.PubkeyData() + 32, pubkey_arr.begin());
+
+    if (m_storage.HasEncryptionKeys()) {
+        // Encrypt and store
+        CKeyingMaterial secret = sk.GetSecret();
+        std::vector<unsigned char> crypted;
+        uint256 iv = (HashWriter{} << GetID() << MakeByteSpan(pubkey_arr)).GetHash();
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+            return EncryptSecret(enc_key, secret, iv, crypted);
+        })) {
+            return false;
+        }
+        if (!batch.WriteCryptedSphincsKey(GetID(), pubkey_arr, crypted)) {
+            return false;
+        }
+        m_crypted_sphincs_key = std::make_pair(pubkey_arr, crypted);
+    } else {
+        // Store unencrypted
+        std::array<unsigned char, 64> secret_arr;
+        std::copy(sk.SecretData(), sk.SecretData() + 64, secret_arr.begin());
+        if (!batch.WriteSphincsKey(GetID(), pubkey_arr, secret_arr)) {
+            return false;
+        }
+        m_sphincs_key = std::move(sk);
+    }
+
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::HasSphincsKey() const
+{
+    LOCK(cs_desc_man);
+    return m_sphincs_key.has_value() || m_crypted_sphincs_key.has_value();
+}
+
+std::optional<std::array<unsigned char, 32>> DescriptorScriptPubKeyMan::GetSphincsPubkey() const
+{
+    LOCK(cs_desc_man);
+    if (m_sphincs_key.has_value() && m_sphincs_key->IsValid()) {
+        std::array<unsigned char, 32> result;
+        std::copy(m_sphincs_key->PubkeyData(), m_sphincs_key->PubkeyData() + 32, result.begin());
+        return result;
+    }
+    if (m_crypted_sphincs_key.has_value()) {
+        return m_crypted_sphincs_key->first;
+    }
+    return std::nullopt;
+}
+
+bool DescriptorScriptPubKeyMan::LoadSphincsKey(std::span<const unsigned char> pubkey,
+                                                std::span<const unsigned char> secret)
+{
+    LOCK(cs_desc_man);
+    SphincsKey sk;
+    if (!sk.Load(secret, pubkey)) {
+        return false;
+    }
+    m_sphincs_key = std::move(sk);
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::LoadCryptedSphincsKey(std::span<const unsigned char> pubkey,
+                                                       const std::vector<unsigned char>& crypted_secret)
+{
+    LOCK(cs_desc_man);
+    if (pubkey.size() != SphincsKey::PUBLIC_SIZE) {
+        return false;
+    }
+    std::array<unsigned char, 32> pubkey_arr;
+    std::copy(pubkey.begin(), pubkey.end(), pubkey_arr.begin());
+    m_crypted_sphincs_key = std::make_pair(pubkey_arr, crypted_secret);
+    return true;
+}
+
+std::optional<SphincsKey> DescriptorScriptPubKeyMan::GetSphincsSigningKey() const
+{
+    LOCK(cs_desc_man);
+
+    // Unencrypted key available directly
+    if (m_sphincs_key.has_value() && m_sphincs_key->IsValid()) {
+        return m_sphincs_key;
+    }
+
+    // Encrypted key — attempt decryption
+    if (m_crypted_sphincs_key.has_value()) {
+        const auto& [pubkey_arr, crypted] = *m_crypted_sphincs_key;
+        CKeyingMaterial plaintext;
+        uint256 iv;
+        {
+            HashWriter hasher{};
+            hasher << GetID();
+            hasher.write(MakeByteSpan(pubkey_arr));
+            iv = hasher.GetHash();
+        }
+        bool decrypted = m_storage.WithEncryptionKey([&](const CKeyingMaterial& enc_key) {
+            return DecryptSecret(enc_key, crypted, iv, plaintext);
+        });
+        if (decrypted && plaintext.size() == SphincsKey::SECRET_SIZE) {
+            SphincsKey sk;
+            if (sk.Load({reinterpret_cast<const unsigned char*>(plaintext.data()), plaintext.size()},
+                        pubkey_arr)) {
+                return sk;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
 } // namespace wallet
